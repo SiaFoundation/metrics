@@ -7,30 +7,43 @@ import (
 	"net/http"
 	"time"
 
+	"go.sia.tech/core/consensus"
 	"go.sia.tech/core/types"
 	"go.sia.tech/jape"
 	"go.sia.tech/metrics/metrics"
 )
 
-// Metrics defines the interface for accessing metrics data.
-type Metrics interface {
-	HostMetric(context.Context, types.PublicKey, time.Time) (metrics.Host, error)
-	RenterMetric(context.Context, types.PublicKey, time.Time) (metrics.Renter, error)
-	GlobalMetric(context.Context, time.Time) (metrics.Metrics, error)
+type (
+	Chain interface {
+		TipState() consensus.State
+		Tip() types.ChainIndex
+	}
 
-	TopHosts(context.Context, time.Time, time.Time, int) ([]metrics.Host, error)
-	TopRenters(context.Context, time.Time, time.Time, int) ([]metrics.Renter, error)
+	// Metrics defines the interface for accessing metrics data.
+	Metrics interface {
+		HostMetric(context.Context, types.PublicKey, time.Time) (metrics.Host, error)
+		RenterMetric(context.Context, types.PublicKey, time.Time) (metrics.Renter, error)
+		GlobalMetric(context.Context, time.Time) (metrics.Metrics, error)
 
-	HostsCount(context.Context, time.Time, time.Time) (int64, error)
-	RentersCount(context.Context, time.Time, time.Time) (int64, error)
+		TopHosts(context.Context, time.Time, time.Time, int) ([]metrics.Host, error)
+		TopRenters(context.Context, time.Time, time.Time, int) ([]metrics.Renter, error)
 
-	HostMetrics(context.Context, types.PublicKey, time.Time, time.Time) ([]metrics.Host, error)
-	RenterMetrics(context.Context, types.PublicKey, time.Time, time.Time) ([]metrics.Renter, error)
-	GlobalMetrics(context.Context, time.Time, time.Time) ([]metrics.Metrics, error)
-}
+		HostsCount(context.Context, time.Time, time.Time) (int64, error)
+		RentersCount(context.Context, time.Time, time.Time) (int64, error)
 
-type api struct {
-	metrics Metrics
+		HostMetrics(context.Context, types.PublicKey, time.Time, time.Time) ([]metrics.Host, error)
+		RenterMetrics(context.Context, types.PublicKey, time.Time, time.Time) ([]metrics.Renter, error)
+		GlobalMetrics(context.Context, time.Time, time.Time) ([]metrics.Metrics, error)
+	}
+
+	api struct {
+		metrics Metrics
+		chain   Chain
+	}
+)
+
+func (a *api) handleConsensusTip(jc jape.Context) {
+	jc.Encode(a.chain.Tip())
 }
 
 func (a *api) handleHostsKeyLast(jc jape.Context) {
@@ -215,6 +228,8 @@ func NewHandler(metrics Metrics) http.Handler {
 	}
 
 	return jape.Mux(map[string]jape.Handler{
+		"GET /consensus/tip": a.handleConsensusTip,
+
 		"GET /count/hosts":              a.handleHostsCount,
 		"GET /count/renters":            a.handleRentersCount,
 		"GET /top/hosts":                a.handleTopHosts,
