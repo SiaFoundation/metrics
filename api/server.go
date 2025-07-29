@@ -117,7 +117,7 @@ func (a *api) handleTopRenters(jc jape.Context) {
 	jc.Encode(renters)
 }
 
-func (a *api) handleUsers(jc jape.Context) {
+func (a *api) handleSummary(jc jape.Context) {
 	ctx := jc.Request.Context()
 	end := time.Now().Truncate(time.Hour)
 	start := end.AddDate(0, -1, 0) // one month ago
@@ -132,11 +132,30 @@ func (a *api) handleUsers(jc jape.Context) {
 		return
 	}
 
-	jc.Encode(UserCountResponse{
-		Hosts:   hosts,
-		Renters: renters,
-		Start:   start,
-		End:     end,
+	last, err := a.metrics.GlobalMetric(ctx, end)
+	if jc.Check("failed to get last global metrics", err) != nil {
+		return
+	}
+
+	first, err := a.metrics.GlobalMetric(ctx, start)
+	if jc.Check("failed to get first global metrics", err) != nil {
+		return
+	}
+
+	lastTotalContracts := last.ActiveContracts + last.FailedContracts + last.RenewedContracts + last.SuccessfulContracts
+	firstTotalContracts := first.ActiveContracts + first.FailedContracts + first.RenewedContracts + first.SuccessfulContracts
+
+	jc.Encode(UsageSummaryResponse{
+		ActiveHosts:   uint64(hosts),
+		ActiveRenters: uint64(renters),
+		NewHosts:      uint64(last.Hosts - first.Hosts),
+		NewRenters:    uint64(last.Renters - first.Renters),
+
+		RenterSpending: last.SpentAllowance.Sub(first.SpentAllowance),
+		NewContracts:   lastTotalContracts - firstTotalContracts,
+
+		Start: start,
+		End:   end,
 	})
 }
 
@@ -229,7 +248,7 @@ func NewHandler(metrics Metrics) http.Handler {
 	return jape.Mux(map[string]jape.Handler{
 		"GET /consensus/tip": a.handleConsensusTip,
 
-		"GET /users":                    a.handleUsers,
+		"GET /summary":                  a.handleSummary,
 		"GET /top/hosts":                a.handleTopHosts,
 		"GET /top/renters":              a.handleTopRenters,
 		"GET /hosts/:key/last":          a.handleHostsKeyLast,
