@@ -1,0 +1,227 @@
+package api
+
+import (
+	"context"
+	"errors"
+	"log"
+	"net/http"
+	"time"
+
+	"go.sia.tech/core/types"
+	"go.sia.tech/jape"
+	"go.sia.tech/metrics/metrics"
+)
+
+type Metrics interface {
+	HostMetric(context.Context, types.PublicKey, time.Time) (metrics.Host, error)
+	RenterMetric(context.Context, types.PublicKey, time.Time) (metrics.Renter, error)
+	GlobalMetric(context.Context, time.Time) (metrics.Metrics, error)
+
+	TopHosts(context.Context, time.Time, time.Time, int) ([]metrics.Host, error)
+	TopRenters(context.Context, time.Time, time.Time, int) ([]metrics.Renter, error)
+
+	HostsCount(context.Context, time.Time, time.Time) (int64, error)
+	RentersCount(context.Context, time.Time, time.Time) (int64, error)
+
+	HostMetrics(context.Context, types.PublicKey, time.Time, time.Time) ([]metrics.Host, error)
+	RenterMetrics(context.Context, types.PublicKey, time.Time, time.Time) ([]metrics.Renter, error)
+	GlobalMetrics(context.Context, time.Time, time.Time) ([]metrics.Metrics, error)
+}
+
+type api struct {
+	metrics Metrics
+}
+
+func (a *api) handleHostsKeyLast(jc jape.Context) {
+	ctx := jc.Request.Context()
+	var hostKey types.PublicKey
+	if err := jc.DecodeParam("key", &hostKey); err != nil {
+		return
+	}
+
+	h, err := a.metrics.HostMetric(ctx, hostKey, time.Now())
+	if errors.Is(err, metrics.ErrNotFound) {
+		jc.Error(metrics.ErrNotFound, http.StatusNotFound)
+		return
+	} else if jc.Check("failed to get last host metrics", err) != nil {
+		return
+	}
+	jc.Encode(h)
+}
+
+func (a *api) handleRentersKeyLast(jc jape.Context) {
+	ctx := jc.Request.Context()
+	var renterKey types.PublicKey
+	if err := jc.DecodeParam("key", &renterKey); err != nil {
+		return
+	}
+
+	h, err := a.metrics.RenterMetric(ctx, renterKey, time.Now())
+	if errors.Is(err, metrics.ErrNotFound) {
+		jc.Error(metrics.ErrNotFound, http.StatusNotFound)
+		return
+	} else if jc.Check("failed to get last renter metrics", err) != nil {
+		return
+	}
+	jc.Encode(h)
+}
+
+func (a *api) handleMetricsLast(jc jape.Context) {
+	ctx := jc.Request.Context()
+
+	m, err := a.metrics.GlobalMetric(ctx, time.Now())
+	if errors.Is(err, metrics.ErrNotFound) {
+		jc.Error(metrics.ErrNotFound, http.StatusNotFound)
+		return
+	} else if jc.Check("failed to get last global metrics", err) != nil {
+		return
+	}
+	jc.Encode(m)
+}
+
+func (a *api) handleTopHosts(jc jape.Context) {
+	ctx := jc.Request.Context()
+	end := time.Now().Truncate(time.Hour)
+	start := end.AddDate(0, -1, 0) // one month ago
+
+	hosts, err := a.metrics.TopHosts(ctx, start, end, 50)
+	if jc.Check("failed to get top hosts", err) != nil {
+		return
+	}
+	jc.Encode(hosts)
+}
+
+func (a *api) handleTopRenters(jc jape.Context) {
+	ctx := jc.Request.Context()
+	end := time.Now().Truncate(time.Hour)
+	start := end.AddDate(0, -1, 0) // one month ago
+
+	renters, err := a.metrics.TopRenters(ctx, start, end, 50)
+	if jc.Check("failed to get top renters", err) != nil {
+		return
+	}
+	jc.Encode(renters)
+}
+
+func (a *api) handleHostsCount(jc jape.Context) {
+	ctx := jc.Request.Context()
+	end := time.Now().Truncate(time.Hour)
+	start := end.AddDate(0, -1, 0) // one month ago
+
+	count, err := a.metrics.HostsCount(ctx, start, end)
+	if jc.Check("failed to get hosts count", err) != nil {
+		return
+	}
+	jc.Encode(count)
+}
+
+func (a *api) handleRentersCount(jc jape.Context) {
+	ctx := jc.Request.Context()
+	end := time.Now().Truncate(time.Hour)
+	start := end.AddDate(0, -1, 0) // one month ago
+
+	count, err := a.metrics.RentersCount(ctx, start, end)
+	if jc.Check("failed to get renters count", err) != nil {
+		return
+	}
+	jc.Encode(count)
+}
+
+func (a *api) handleDeltaDaysHosts(jc jape.Context) {
+	ctx := jc.Request.Context()
+	var days int
+	err := jc.DecodeParam("days", &days)
+	if err != nil {
+		return
+	}
+
+	var hostKey types.PublicKey
+	if err := jc.DecodeParam("key", &hostKey); err != nil {
+		return
+	}
+	end := time.Now().Truncate(time.Hour)
+	start := end.AddDate(0, 0, -days)
+	log.Println(days, start, end)
+
+	first, err := a.metrics.HostMetric(ctx, hostKey, start)
+	if jc.Check("failed to get delta hosts", err) != nil {
+		return
+	}
+	last, err := a.metrics.HostMetric(ctx, hostKey, end)
+	if jc.Check("failed to get delta hosts", err) != nil {
+		return
+	}
+
+	jc.Encode([]metrics.Host{first, last})
+}
+
+func (a *api) handleDeltaDaysRenters(jc jape.Context) {
+	ctx := jc.Request.Context()
+	var days int
+	err := jc.DecodeParam("days", &days)
+	if err != nil {
+		return
+	}
+
+	var renterKey types.PublicKey
+	if err := jc.DecodeParam("key", &renterKey); err != nil {
+		return
+	}
+	end := time.Now().Truncate(time.Hour)
+	start := end.AddDate(0, 0, -days)
+	log.Println(days, start, end)
+
+	first, err := a.metrics.RenterMetric(ctx, renterKey, start)
+	if jc.Check("failed to get delta renters", err) != nil {
+		return
+	}
+	last, err := a.metrics.RenterMetric(ctx, renterKey, end)
+	if jc.Check("failed to get delta renters", err) != nil {
+		return
+	}
+
+	jc.Encode([]metrics.Renter{first, last})
+}
+
+func (a *api) handleDeltaDaysMetrics(jc jape.Context) {
+	ctx := jc.Request.Context()
+	var days int
+	err := jc.DecodeParam("days", &days)
+	if err != nil {
+		return
+	}
+
+	end := time.Now().Truncate(time.Hour)
+	start := end.AddDate(0, 0, -days)
+	log.Println(days, start, end)
+
+	first, err := a.metrics.GlobalMetric(ctx, start)
+	if jc.Check("failed to get delta metrics", err) != nil {
+		return
+	}
+	last, err := a.metrics.GlobalMetric(ctx, end)
+	if jc.Check("failed to get delta metrics", err) != nil {
+		return
+	}
+
+	jc.Encode([]metrics.Metrics{first, last})
+}
+
+func NewHandler(metrics Metrics) http.Handler {
+	a := &api{
+		metrics: metrics,
+	}
+
+	return jape.Mux(map[string]jape.Handler{
+		"GET /count/hosts":              a.handleHostsCount,
+		"GET /count/renters":            a.handleRentersCount,
+		"GET /top/hosts":                a.handleTopHosts,
+		"GET /top/renters":              a.handleTopRenters,
+		"GET /hosts/:key/last":          a.handleHostsKeyLast,
+		"GET /renters/:key/last":        a.handleRentersKeyLast,
+		"GET /metrics/last":             a.handleMetricsLast,
+		"GET /delta/:days/hosts/:key":   a.handleDeltaDaysHosts,
+		"GET /delta/:days/renters/:key": a.handleDeltaDaysRenters,
+		"GET /delta/:days/metrics":      a.handleDeltaDaysMetrics,
+	})
+}
