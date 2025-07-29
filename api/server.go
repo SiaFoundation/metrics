@@ -117,28 +117,27 @@ func (a *api) handleTopRenters(jc jape.Context) {
 	jc.Encode(renters)
 }
 
-func (a *api) handleHostsCount(jc jape.Context) {
+func (a *api) handleUsers(jc jape.Context) {
 	ctx := jc.Request.Context()
 	end := time.Now().Truncate(time.Hour)
 	start := end.AddDate(0, -1, 0) // one month ago
 
-	count, err := a.metrics.HostsCount(ctx, start, end)
+	hosts, err := a.metrics.HostsCount(ctx, start, end)
 	if jc.Check("failed to get hosts count", err) != nil {
 		return
 	}
-	jc.Encode(count)
-}
 
-func (a *api) handleRentersCount(jc jape.Context) {
-	ctx := jc.Request.Context()
-	end := time.Now().Truncate(time.Hour)
-	start := end.AddDate(0, -1, 0) // one month ago
-
-	count, err := a.metrics.RentersCount(ctx, start, end)
+	renters, err := a.metrics.RentersCount(ctx, start, end)
 	if jc.Check("failed to get renters count", err) != nil {
 		return
 	}
-	jc.Encode(count)
+
+	jc.Encode(UserCountResponse{
+		Hosts:   hosts,
+		Renters: renters,
+		Start:   start,
+		End:     end,
+	})
 }
 
 func (a *api) handleDeltaDaysHosts(jc jape.Context) {
@@ -230,8 +229,7 @@ func NewHandler(metrics Metrics) http.Handler {
 	return jape.Mux(map[string]jape.Handler{
 		"GET /consensus/tip": a.handleConsensusTip,
 
-		"GET /count/hosts":              a.handleHostsCount,
-		"GET /count/renters":            a.handleRentersCount,
+		"GET /users":                    a.handleUsers,
 		"GET /top/hosts":                a.handleTopHosts,
 		"GET /top/renters":              a.handleTopRenters,
 		"GET /hosts/:key/last":          a.handleHostsKeyLast,
