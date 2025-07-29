@@ -12,6 +12,7 @@ import (
 	"go.sia.tech/metrics/metrics"
 )
 
+// Metrics defines the interface for accessing metrics data.
 type Metrics interface {
 	HostMetric(context.Context, types.PublicKey, time.Time) (metrics.Host, error)
 	RenterMetric(context.Context, types.PublicKey, time.Time) (metrics.Renter, error)
@@ -207,6 +208,7 @@ func (a *api) handleDeltaDaysMetrics(jc jape.Context) {
 	jc.Encode([]metrics.Metrics{first, last})
 }
 
+// NewHandler creates a new HTTP handler for the metrics API.
 func NewHandler(metrics Metrics) http.Handler {
 	a := &api{
 		metrics: metrics,

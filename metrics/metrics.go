@@ -13,6 +13,7 @@ import (
 	"go.uber.org/zap"
 )
 
+// ContractResolutionType represents the type of contract resolution.
 const (
 	ResolutionTypeProof = iota + 1
 	ResolutionTypeExpired
@@ -20,8 +21,10 @@ const (
 )
 
 type (
+	// A ContractResolutionType represents the type of contract resolution.
 	ContractResolutionType uint8
 
+	// A Host represents the metrics for a host.
 	Host struct {
 		PublicKey           types.PublicKey `json:"publicKey"`
 		ActiveContracts     uint64          `json:"activeContracts"`
@@ -40,6 +43,7 @@ type (
 		Timestamp        time.Time      `json:"timestamp"`
 	}
 
+	// A Renter represents the metrics for a renter.
 	Renter struct {
 		PublicKey types.PublicKey `json:"publicKey"`
 
@@ -56,6 +60,7 @@ type (
 		Timestamp time.Time      `json:"timestamp"`
 	}
 
+	// Metrics represents the global metrics.
 	Metrics struct {
 		Renters uint64 `json:"renters"`
 		Hosts   uint64 `json:"hosts"`
@@ -80,6 +85,7 @@ type (
 		Timestamp time.Time `json:"timestamp"`
 	}
 
+	// A ContractFormation represents the formation of a new contract.
 	ContractFormation struct {
 		Host   types.PublicKey
 		Renter types.PublicKey
@@ -91,6 +97,7 @@ type (
 		HostPotentialRevenue types.Currency
 	}
 
+	// A ContractRevision represents a revision of an existing contract.
 	ContractRevision struct {
 		Host   types.PublicKey
 		Renter types.PublicKey
@@ -108,6 +115,7 @@ type (
 		NewPotentialRevenue      types.Currency
 	}
 
+	// A ContractResolution represents the resolution of a contract.
 	ContractResolution struct {
 		Host   types.PublicKey
 		Renter types.PublicKey
@@ -124,6 +132,7 @@ type (
 		HostEarnedRevenue    types.Currency
 	}
 
+	// A State represents the state of the chain at a specific timestamp.
 	State struct {
 		Timestamp time.Time `json:"timestamp"`
 
@@ -132,6 +141,7 @@ type (
 		Resolutions []ContractResolution `json:"validResolutions"`
 	}
 
+	// A Chain provides access to the chain state and updates.
 	Chain interface {
 		TipState() consensus.State
 		UpdatesSince(index types.ChainIndex, limit int) ([]chain.RevertUpdate, []chain.ApplyUpdate, error)
@@ -139,12 +149,7 @@ type (
 		OnReorg(func(types.ChainIndex)) func()
 	}
 
-	UpdateState interface {
-		AddContractFormation(ContractFormation) error
-		AddContractParticipants(addr types.Address, renter types.PublicKey, host types.PublicKey) error
-		ContractFormation(types.FileContractID) (types.FileContractElement, error)
-	}
-
+	// A Store provides access to the persistent store for metrics.
 	Store interface {
 		LastIndexedTip(context.Context) (types.ChainIndex, error)
 		RevertState(context.Context, types.ChainIndex, State) error
@@ -165,6 +170,7 @@ type (
 		RentersCount(ctx context.Context, start, end time.Time) (int64, error)
 	}
 
+	// A Manager provides access to the metrics and manages the indexing of the chain state.
 	Manager struct {
 		tg    *threadgroup.ThreadGroup
 		chain Chain
@@ -174,8 +180,10 @@ type (
 )
 
 var (
+	// ErrTipNotFound is returned when the last indexed tip is not found in the store.
 	ErrTipNotFound = fmt.Errorf("tip not found")
-	ErrNotFound    = fmt.Errorf("not found")
+	// ErrNotFound is returned when a requested metric is not found.
+	ErrNotFound = fmt.Errorf("not found")
 )
 
 func parseDiffs(timestamp time.Time, diffs []consensus.V2FileContractElementDiff, log *zap.Logger) (State, error) {
@@ -302,42 +310,52 @@ func (m *Manager) indexState(ctx context.Context, tip types.ChainIndex) (types.C
 	}
 }
 
+// RenterMetric retrieves the latest metrics for a renter.
 func (m *Manager) RenterMetric(ctx context.Context, renterKey types.PublicKey, timestamp time.Time) (Renter, error) {
 	return m.store.RenterMetric(ctx, renterKey, timestamp)
 }
 
+// HostMetric retrieves the latest metrics for a host.
 func (m *Manager) HostMetric(ctx context.Context, hostKey types.PublicKey, timestamp time.Time) (Host, error) {
 	return m.store.HostMetric(ctx, hostKey, timestamp)
 }
 
+// GlobalMetric retrieves the latest metrics for the global state.
 func (m *Manager) GlobalMetric(ctx context.Context, timestamp time.Time) (Metrics, error) {
 	return m.store.GlobalMetric(ctx, timestamp)
 }
 
+// RenterMetrics retrieves metrics for a renter over a time range.
 func (m *Manager) RenterMetrics(ctx context.Context, renterKey types.PublicKey, start, end time.Time) ([]Renter, error) {
 	return m.store.RenterMetrics(ctx, renterKey, start, end)
 }
 
+// HostMetrics retrieves metrics for a host over a time range.
 func (m *Manager) HostMetrics(ctx context.Context, hostKey types.PublicKey, start, end time.Time) ([]Host, error) {
 	return m.store.HostMetrics(ctx, hostKey, start, end)
 }
 
+// GlobalMetrics retrieves global metrics over a time range.
 func (m *Manager) GlobalMetrics(ctx context.Context, start, end time.Time) ([]Metrics, error) {
 	return m.store.GlobalMetrics(ctx, start, end)
 }
 
+// TopHosts retrieves the top hosts based on their metrics over a time range.
 func (m *Manager) TopHosts(ctx context.Context, start, end time.Time, limit int) ([]Host, error) {
 	return m.store.TopHosts(ctx, start, end, limit)
 }
 
+// TopRenters retrieves the top renters based on their metrics over a time range.
 func (m *Manager) TopRenters(ctx context.Context, start, end time.Time, limit int) ([]Renter, error) {
 	return m.store.TopRenters(ctx, start, end, limit)
 }
 
+// HostsCount retrieves the count of hosts over a time range.
 func (m *Manager) HostsCount(ctx context.Context, start, end time.Time) (int64, error) {
 	return m.store.HostsCount(ctx, start, end)
 }
 
+// RentersCount retrieves the count of renters over a time range.
 func (m *Manager) RentersCount(ctx context.Context, start, end time.Time) (int64, error) {
 	return m.store.RentersCount(ctx, start, end)
 }
@@ -348,6 +366,7 @@ func (m *Manager) Close() error {
 	return nil
 }
 
+// NewManager creates a new metrics manager that indexes the chain state and provides access to metrics.
 func NewManager(chain Chain, store Store, log *zap.Logger) (*Manager, error) {
 	m := &Manager{
 		chain: chain,

@@ -27,98 +27,7 @@ func (s *Store) LastIndexedTip(ctx context.Context) (index types.ChainIndex, err
 	return
 }
 
-func getRenterMetrics(ctx context.Context, tx *txn, renterKey types.PublicKey, timestamp time.Time) (metrics.Renter, error) {
-	row := tx.QueryRow(ctx, `SELECT renter_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, 
-	active_size, total_size, locked_allowance, spent_allowance, date_created 
-FROM renter_metrics WHERE renter_key=$1 AND date_created <= $2
-ORDER BY date_created DESC LIMIT 1;`, sqlHash256(renterKey), sqlTime(timestamp))
-	m, err := scanRenter(row)
-	m.PublicKey = renterKey
-	m.Timestamp = timestamp
-	return m, err
-}
-
-func getHostMetrics(ctx context.Context, tx *txn, hostKey types.PublicKey, timestamp time.Time) (metrics.Host, error) {
-	row := tx.QueryRow(ctx, `SELECT host_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, 
-	active_size, total_size, burnt_collateral, locked_collateral, risked_collateral, potential_revenue, earned_revenue, date_created 
-FROM host_metrics WHERE host_key=$1 AND date_created <= $2
-ORDER BY date_created DESC LIMIT 1;`, sqlHash256(hostKey), sqlTime(timestamp))
-	m, err := scanHost(row)
-	m.PublicKey = hostKey
-	m.Timestamp = timestamp
-	return m, err
-}
-
-func getMetrics(ctx context.Context, tx *txn, timestamp time.Time) (metrics.Metrics, error) {
-	row := tx.QueryRow(ctx, `SELECT renters, hosts, active_contracts, renewed_contracts, successful_contracts, failed_contracts, 
-active_size, total_size, spent_allowance, locked_allowance, potential_revenue, earned_revenue, locked_collateral, 
-risked_collateral, burnt_collateral, date_created
-FROM metrics WHERE date_created <= $1
-ORDER BY date_created DESC LIMIT 1;`, sqlTime(timestamp))
-	m, err := scanMetrics(row)
-	m.Timestamp = timestamp
-	return m, err
-}
-
-func insertHostMetrics(ctx context.Context, tx *txn, m metrics.Host) error {
-	_, err := tx.Exec(ctx, `INSERT OR REPLACE INTO host_metrics (host_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, active_size, total_size, burnt_collateral, locked_collateral, risked_collateral, potential_revenue, earned_revenue, date_created)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13);`,
-		sqlHash256(m.PublicKey),
-		m.ActiveContracts,
-		m.RenewedContracts,
-		m.SuccessfulContracts,
-		m.FailedContracts,
-		m.ActiveSize,
-		m.TotalSize,
-		sqlCurrency(m.BurntCollateral),
-		sqlCurrency(m.LockedCollateral),
-		sqlCurrency(m.RiskedCollateral),
-		sqlCurrency(m.PotentialRevenue),
-		sqlCurrency(m.EarnedRevenue),
-		sqlTime(m.Timestamp))
-	return err
-}
-
-func insertRenterMetrics(ctx context.Context, tx *txn, m metrics.Renter) error {
-	_, err := tx.Exec(ctx, `INSERT OR REPLACE INTO renter_metrics (renter_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, active_size, total_size, locked_allowance, spent_allowance, date_created)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10);`,
-		sqlHash256(m.PublicKey),
-		m.ActiveContracts,
-		m.RenewedContracts,
-		m.SuccessfulContracts,
-		m.FailedContracts,
-		m.ActiveSize,
-		m.TotalSize,
-		sqlCurrency(m.Locked),
-		sqlCurrency(m.Spent),
-		sqlTime(m.Timestamp))
-	return err
-}
-
-func insertMetrics(ctx context.Context, tx *txn, m metrics.Metrics) error {
-	_, err := tx.Exec(ctx, `INSERT OR REPLACE INTO metrics (renters, hosts, active_contracts, 
-renewed_contracts, successful_contracts, failed_contracts, active_size, total_size, spent_allowance, locked_allowance,
-potential_revenue, earned_revenue, locked_collateral, risked_collateral, burnt_collateral, date_created)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16);`,
-		m.Renters,
-		m.Hosts,
-		m.ActiveContracts,
-		m.RenewedContracts,
-		m.SuccessfulContracts,
-		m.FailedContracts,
-		m.ActiveSize,
-		m.TotalSize,
-		sqlCurrency(m.SpentAllowance),
-		sqlCurrency(m.LockedAllowance),
-		sqlCurrency(m.PotentialRevenue),
-		sqlCurrency(m.EarnedRevenue),
-		sqlCurrency(m.LockedCollateral),
-		sqlCurrency(m.RiskedCollateral),
-		sqlCurrency(m.BurntCollateral),
-		sqlTime(m.Timestamp))
-	return err
-}
-
+// RevertState reverts the store to a previous state based on the provided tip and state.
 func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state metrics.State) error {
 	return s.transaction(ctx, func(ctx context.Context, tx *txn) error {
 		for _, formation := range state.Formations {
@@ -273,6 +182,7 @@ func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state met
 	})
 }
 
+// ApplyState applies the provided state to the store, updating the metrics accordingly.
 func (s *Store) ApplyState(ctx context.Context, tip types.ChainIndex, state metrics.State) error {
 	return s.transaction(ctx, func(ctx context.Context, tx *txn) error {
 		for _, formation := range state.Formations {
@@ -444,6 +354,7 @@ func (s *Store) ApplyState(ctx context.Context, tip types.ChainIndex, state metr
 	})
 }
 
+// RenterMetric retrieves the latest renter metrics for a given renter key and timestamp.
 func (s *Store) RenterMetric(ctx context.Context, renterKey types.PublicKey, timestamp time.Time) (m metrics.Renter, err error) {
 	err = s.transaction(ctx, func(ctx context.Context, tx *txn) error {
 		row := tx.QueryRow(ctx, `SELECT renter_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, active_size, total_size, locked_allowance, spent_allowance, date_created
@@ -458,6 +369,7 @@ FROM renter_metrics WHERE renter_key=$1 AND date_created <= $2 ORDER BY date_cre
 	return
 }
 
+// HostMetric retrieves the latest host metrics for a given host key and timestamp.
 func (s *Store) HostMetric(ctx context.Context, hostKey types.PublicKey, timestamp time.Time) (m metrics.Host, err error) {
 	err = s.transaction(ctx, func(ctx context.Context, tx *txn) error {
 		row := tx.QueryRow(ctx, `SELECT host_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, active_size, total_size, burnt_collateral, locked_collateral, risked_collateral, potential_revenue, earned_revenue, date_created
@@ -471,6 +383,7 @@ FROM host_metrics WHERE host_key=$1 AND date_created <= $2 ORDER BY date_created
 	return
 }
 
+// GlobalMetric retrieves the latest global metrics for a given timestamp.
 func (s *Store) GlobalMetric(ctx context.Context, timestamp time.Time) (m metrics.Metrics, err error) {
 	err = s.transaction(ctx, func(ctx context.Context, tx *txn) error {
 		row := tx.QueryRow(ctx, `SELECT renters, hosts, active_contracts, renewed_contracts, successful_contracts, failed_contracts, active_size, total_size, spent_allowance, locked_allowance,
@@ -482,6 +395,7 @@ FROM metrics WHERE date_created <= $1 ORDER BY date_created DESC LIMIT 1;`, sqlT
 	return
 }
 
+// HostMetrics retrieves host metrics for a specific host key within a given time range.
 func (s *Store) HostMetrics(ctx context.Context, hostKey types.PublicKey, start, end time.Time) (ms []metrics.Host, err error) {
 	err = s.transaction(ctx, func(ctx context.Context, tx *txn) error {
 		rows, err := tx.Query(ctx, `SELECT host_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, active_size, total_size, burnt_collateral, locked_collateral, risked_collateral, potential_revenue, earned_revenue, date_created
@@ -507,6 +421,7 @@ FROM host_metrics WHERE host_key=$1 AND date_created BETWEEN $2 AND $3 ORDER BY 
 	return
 }
 
+// RenterMetrics retrieves renter metrics for a specific renter key within a given time range.
 func (s *Store) RenterMetrics(ctx context.Context, renterKey types.PublicKey, start, end time.Time) (ms []metrics.Renter, err error) {
 	err = s.transaction(ctx, func(ctx context.Context, tx *txn) error {
 		rows, err := tx.Query(ctx, `SELECT renter_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, active_size, total_size, locked_allowance, spent_allowance, date_created
@@ -532,6 +447,7 @@ FROM renter_metrics WHERE renter_key=$1 AND date_created BETWEEN $2 AND $3 ORDER
 	return
 }
 
+// GlobalMetrics retrieves global metrics within a specified time range.
 func (s *Store) GlobalMetrics(ctx context.Context, start, end time.Time) (ms []metrics.Metrics, err error) {
 	err = s.transaction(ctx, func(ctx context.Context, tx *txn) error {
 		rows, err := tx.Query(ctx, `SELECT renters, hosts, active_contracts, renewed_contracts, successful_contracts, failed_contracts, active_size, total_size, spent_allowance, locked_allowance,
@@ -573,6 +489,8 @@ func (s *Store) RentersCount(ctx context.Context, start, end time.Time) (n int64
 	return
 }
 
+// TopHosts retrieves the top hosts based on earned revenue within a specified time range.
+// The results are limited to the specified number of hosts.
 func (s *Store) TopHosts(ctx context.Context, start, end time.Time, limit int) (ms []metrics.Host, err error) {
 	err = s.transaction(ctx, func(ctx context.Context, tx *txn) error {
 		rows, err := tx.Query(ctx, `SELECT host_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, active_size, total_size, burnt_collateral, locked_collateral, risked_collateral, potential_revenue, earned_revenue, date_created
@@ -595,6 +513,8 @@ FROM host_metrics WHERE date_created BETWEEN $1 AND $2 GROUP BY host_key ORDER B
 	return
 }
 
+// TopRenters retrieves the top renters based on spent allowance within a specified time range.
+// The results are limited to the specified number of renters.
 func (s *Store) TopRenters(ctx context.Context, start, end time.Time, limit int) (ms []metrics.Renter, err error) {
 	err = s.transaction(ctx, func(ctx context.Context, tx *txn) error {
 		rows, err := tx.Query(ctx, `SELECT renter_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, active_size, total_size, locked_allowance, max(spent_allowance), date_created
@@ -615,6 +535,98 @@ FROM renter_metrics WHERE date_created BETWEEN $1 AND $2 GROUP BY renter_key ORD
 		return rows.Err()
 	})
 	return
+}
+
+func getRenterMetrics(ctx context.Context, tx *txn, renterKey types.PublicKey, timestamp time.Time) (metrics.Renter, error) {
+	row := tx.QueryRow(ctx, `SELECT renter_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, 
+	active_size, total_size, locked_allowance, spent_allowance, date_created 
+FROM renter_metrics WHERE renter_key=$1 AND date_created <= $2
+ORDER BY date_created DESC LIMIT 1;`, sqlHash256(renterKey), sqlTime(timestamp))
+	m, err := scanRenter(row)
+	m.PublicKey = renterKey
+	m.Timestamp = timestamp
+	return m, err
+}
+
+func getHostMetrics(ctx context.Context, tx *txn, hostKey types.PublicKey, timestamp time.Time) (metrics.Host, error) {
+	row := tx.QueryRow(ctx, `SELECT host_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, 
+	active_size, total_size, burnt_collateral, locked_collateral, risked_collateral, potential_revenue, earned_revenue, date_created 
+FROM host_metrics WHERE host_key=$1 AND date_created <= $2
+ORDER BY date_created DESC LIMIT 1;`, sqlHash256(hostKey), sqlTime(timestamp))
+	m, err := scanHost(row)
+	m.PublicKey = hostKey
+	m.Timestamp = timestamp
+	return m, err
+}
+
+func getMetrics(ctx context.Context, tx *txn, timestamp time.Time) (metrics.Metrics, error) {
+	row := tx.QueryRow(ctx, `SELECT renters, hosts, active_contracts, renewed_contracts, successful_contracts, failed_contracts, 
+active_size, total_size, spent_allowance, locked_allowance, potential_revenue, earned_revenue, locked_collateral, 
+risked_collateral, burnt_collateral, date_created
+FROM metrics WHERE date_created <= $1
+ORDER BY date_created DESC LIMIT 1;`, sqlTime(timestamp))
+	m, err := scanMetrics(row)
+	m.Timestamp = timestamp
+	return m, err
+}
+
+func insertHostMetrics(ctx context.Context, tx *txn, m metrics.Host) error {
+	_, err := tx.Exec(ctx, `INSERT OR REPLACE INTO host_metrics (host_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, active_size, total_size, burnt_collateral, locked_collateral, risked_collateral, potential_revenue, earned_revenue, date_created)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13);`,
+		sqlHash256(m.PublicKey),
+		m.ActiveContracts,
+		m.RenewedContracts,
+		m.SuccessfulContracts,
+		m.FailedContracts,
+		m.ActiveSize,
+		m.TotalSize,
+		sqlCurrency(m.BurntCollateral),
+		sqlCurrency(m.LockedCollateral),
+		sqlCurrency(m.RiskedCollateral),
+		sqlCurrency(m.PotentialRevenue),
+		sqlCurrency(m.EarnedRevenue),
+		sqlTime(m.Timestamp))
+	return err
+}
+
+func insertRenterMetrics(ctx context.Context, tx *txn, m metrics.Renter) error {
+	_, err := tx.Exec(ctx, `INSERT OR REPLACE INTO renter_metrics (renter_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, active_size, total_size, locked_allowance, spent_allowance, date_created)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10);`,
+		sqlHash256(m.PublicKey),
+		m.ActiveContracts,
+		m.RenewedContracts,
+		m.SuccessfulContracts,
+		m.FailedContracts,
+		m.ActiveSize,
+		m.TotalSize,
+		sqlCurrency(m.Locked),
+		sqlCurrency(m.Spent),
+		sqlTime(m.Timestamp))
+	return err
+}
+
+func insertMetrics(ctx context.Context, tx *txn, m metrics.Metrics) error {
+	_, err := tx.Exec(ctx, `INSERT OR REPLACE INTO metrics (renters, hosts, active_contracts, 
+renewed_contracts, successful_contracts, failed_contracts, active_size, total_size, spent_allowance, locked_allowance,
+potential_revenue, earned_revenue, locked_collateral, risked_collateral, burnt_collateral, date_created)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16);`,
+		m.Renters,
+		m.Hosts,
+		m.ActiveContracts,
+		m.RenewedContracts,
+		m.SuccessfulContracts,
+		m.FailedContracts,
+		m.ActiveSize,
+		m.TotalSize,
+		sqlCurrency(m.SpentAllowance),
+		sqlCurrency(m.LockedAllowance),
+		sqlCurrency(m.PotentialRevenue),
+		sqlCurrency(m.EarnedRevenue),
+		sqlCurrency(m.LockedCollateral),
+		sqlCurrency(m.RiskedCollateral),
+		sqlCurrency(m.BurntCollateral),
+		sqlTime(m.Timestamp))
+	return err
 }
 
 func scanMetrics(s scanner) (m metrics.Metrics, err error) {
