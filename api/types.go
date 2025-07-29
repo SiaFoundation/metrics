@@ -6,6 +6,8 @@ import (
 	"go.sia.tech/core/types"
 )
 
+// UsageSummaryResponse represents the summary of usage metrics
+// for a period of time.
 type UsageSummaryResponse struct {
 	ActiveHosts   uint64 `json:"activeHosts"`
 	ActiveRenters uint64 `json:"activeRenters"`

@@ -14,6 +14,7 @@ import (
 )
 
 type (
+	// Chain defines the interface for accessing blockchain state.
 	Chain interface {
 		TipState() consensus.State
 		Tip() types.ChainIndex
