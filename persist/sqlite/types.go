@@ -26,20 +26,6 @@ func (st *sqlTime) Scan(src any) error {
 	return errors.New("invalid type")
 }
 
-type sqlPublicKey types.PublicKey
-
-func (pk sqlPublicKey) Value() (driver.Value, error) {
-	return pk[:], nil
-}
-
-func (pk *sqlPublicKey) Scan(src any) error {
-	if b, ok := src.([]byte); ok {
-		copy((*pk)[:], b)
-		return nil
-	}
-	return errors.New("invalid type")
-}
-
 type sqlHash256 types.Hash256
 
 func (h sqlHash256) Value() (driver.Value, error) {

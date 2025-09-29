@@ -71,6 +71,11 @@ func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state met
 		}
 
 		for _, revision := range state.Revisions {
+			spent, ok := revision.ExistingAllowance.SubWithUnderflow(revision.NewAllowance)
+			if !ok {
+				spent = types.ZeroCurrency
+			}
+
 			hm, err := getHostMetrics(ctx, tx, revision.Host, state.Timestamp)
 			if err != nil {
 				return fmt.Errorf("failed to get host metrics for %q: %w", revision.Host, err)
@@ -87,10 +92,7 @@ func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state met
 			rm.ActiveSize = rm.ActiveSize - revision.NewSize + revision.ExistingSize
 			rm.TotalSize = rm.TotalSize - revision.NewSize + revision.ExistingSize
 			rm.Locked = rm.Locked.Sub(revision.NewAllowance).Add(revision.ExistingAllowance)
-			spent, ok := revision.NewAllowance.SubWithUnderflow(revision.ExistingAllowance)
-			if ok {
-				rm.Spent = rm.Spent.Sub(spent)
-			}
+			rm.Spent = rm.Spent.Sub(spent)
 
 			gm, err := getMetrics(ctx, tx, state.Timestamp)
 			if err != nil {
@@ -101,9 +103,7 @@ func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state met
 			gm.LockedAllowance = gm.LockedAllowance.Sub(revision.NewAllowance).Add(revision.ExistingAllowance)
 			gm.PotentialRevenue = gm.PotentialRevenue.Sub(revision.NewPotentialRevenue).Add(revision.ExistingPotentialRevenue)
 			gm.RiskedCollateral = gm.RiskedCollateral.Sub(revision.NewRiskedCollateral).Add(revision.ExistingRiskedCollateral)
-			if ok {
-				gm.SpentAllowance = gm.SpentAllowance.Sub(spent)
-			}
+			gm.SpentAllowance = gm.SpentAllowance.Sub(spent)
 
 			if err := insertMetrics(ctx, tx, gm); err != nil {
 				return fmt.Errorf("failed to insert global metrics: %w", err)
@@ -134,15 +134,17 @@ func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state met
 			rm.ActiveContracts++
 			rm.ActiveSize += resolution.Size
 			rm.Locked = rm.Locked.Add(resolution.RenterAllowance)
+			rm.Spent = rm.Spent.Sub(resolution.RenterSpent)
 
 			gm, err := getMetrics(ctx, tx, state.Timestamp)
 			if err != nil {
 				return fmt.Errorf("failed to get global metrics: %w", err)
 			}
 			gm.ActiveContracts++
+			gm.SpentAllowance = gm.SpentAllowance.Sub(resolution.RenterSpent)
+			gm.LockedAllowance = gm.LockedAllowance.Add(resolution.RenterAllowance)
 			gm.EarnedRevenue = gm.EarnedRevenue.Sub(resolution.HostEarnedRevenue)
 			gm.BurntCollateral = gm.BurntCollateral.Sub(resolution.HostBurn)
-			gm.LockedAllowance = gm.LockedAllowance.Add(resolution.RenterAllowance)
 			gm.PotentialRevenue = gm.PotentialRevenue.Add(resolution.HostPotentialRevenue)
 			gm.LockedCollateral = gm.LockedCollateral.Add(resolution.HostLockedCollateral)
 			gm.RiskedCollateral = gm.RiskedCollateral.Add(resolution.HostRiskedCollateral)
