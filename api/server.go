@@ -93,6 +93,33 @@ func (a *api) handleMetricsLast(jc jape.Context) {
 	jc.Encode(m)
 }
 
+// handleMetrics returns the global metrics time series in [start, end].
+// Both bounds are optional: if neither is provided the window defaults to
+// the last 30 days truncated to the hour, matching the rest of the API.
+// Snapshots are hourly, ordered by timestamp ascending.
+func (a *api) handleMetrics(jc jape.Context) {
+	ctx := jc.Request.Context()
+
+	end := time.Now().Truncate(time.Hour)
+	start := end.AddDate(0, -1, 0) // one month ago
+	if err := jc.DecodeForm("start", &start); err != nil {
+		return
+	}
+	if err := jc.DecodeForm("end", &end); err != nil {
+		return
+	}
+	if !end.After(start) {
+		jc.Error(errors.New("end must be after start"), http.StatusBadRequest)
+		return
+	}
+
+	ms, err := a.metrics.GlobalMetrics(ctx, start, end)
+	if jc.Check("failed to get global metrics", err) != nil {
+		return
+	}
+	jc.Encode(ms)
+}
+
 func (a *api) handleTopHosts(jc jape.Context) {
 	ctx := jc.Request.Context()
 	end := time.Now().Truncate(time.Hour)
@@ -251,6 +278,7 @@ func NewHandler(chain Chain, metrics Metrics) http.Handler {
 		"GET /top/renters":              a.handleTopRenters,
 		"GET /hosts/:key/last":          a.handleHostsKeyLast,
 		"GET /renters/:key/last":        a.handleRentersKeyLast,
+		"GET /metrics":                  a.handleMetrics,
 		"GET /metrics/last":             a.handleMetricsLast,
 		"GET /delta/:days/hosts/:key":   a.handleDeltaDaysHosts,
 		"GET /delta/:days/renters/:key": a.handleDeltaDaysRenters,
