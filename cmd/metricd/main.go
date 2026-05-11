@@ -117,7 +117,7 @@ func main() {
 	defer l.Close()
 
 	srv := &http.Server{
-		Handler: api.NewHandler(metrics),
+		Handler: api.NewHandler(cm, metrics),
 		BaseContext: func(l net.Listener) context.Context {
 			return ctx
 		},

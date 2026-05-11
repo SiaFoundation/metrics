@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"errors"
-	"log"
 	"net/http"
 	"time"
 
@@ -174,7 +173,6 @@ func (a *api) handleDeltaDaysHosts(jc jape.Context) {
 	}
 	end := time.Now().Truncate(time.Hour)
 	start := end.AddDate(0, 0, -days)
-	log.Println(days, start, end)
 
 	first, err := a.metrics.HostMetric(ctx, hostKey, start)
 	if jc.Check("failed to get delta hosts", err) != nil {
@@ -202,7 +200,6 @@ func (a *api) handleDeltaDaysRenters(jc jape.Context) {
 	}
 	end := time.Now().Truncate(time.Hour)
 	start := end.AddDate(0, 0, -days)
-	log.Println(days, start, end)
 
 	first, err := a.metrics.RenterMetric(ctx, renterKey, start)
 	if jc.Check("failed to get delta renters", err) != nil {
@@ -226,7 +223,6 @@ func (a *api) handleDeltaDaysMetrics(jc jape.Context) {
 
 	end := time.Now().Truncate(time.Hour)
 	start := end.AddDate(0, 0, -days)
-	log.Println(days, start, end)
 
 	first, err := a.metrics.GlobalMetric(ctx, start)
 	if jc.Check("failed to get delta metrics", err) != nil {
@@ -241,8 +237,9 @@ func (a *api) handleDeltaDaysMetrics(jc jape.Context) {
 }
 
 // NewHandler creates a new HTTP handler for the metrics API.
-func NewHandler(metrics Metrics) http.Handler {
+func NewHandler(chain Chain, metrics Metrics) http.Handler {
 	a := &api{
+		chain:   chain,
 		metrics: metrics,
 	}
 
