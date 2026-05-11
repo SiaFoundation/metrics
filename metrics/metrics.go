@@ -435,9 +435,19 @@ func parseDiffs(timestamp time.Time, cs consensus.State, diffs []consensus.V2Fil
 					break
 				}
 				cr.Type = ResolutionTypeRenewed
-				if res.FinalHostOutput.Value.Cmp(fc.TotalCollateral) > 0 {
-					cr.HostEarnedRevenue = res.FinalHostOutput.Value.Sub(fc.TotalCollateral)
-				}
+				// The host's accrued revenue over the old contract's
+				// life is HostOutput.Value − TotalCollateral, the same
+				// quantity earned on a storage proof. Whether that
+				// revenue is paid out at renewal as FinalHostOutput or
+				// carried into the new contract as part of HostRollover
+				// is irrelevant to the old contract's books: it's still
+				// earnings attributable to this contract. In the typical
+				// RHP4 renewal/refresh, HostRollover absorbs the locked
+				// collateral and FinalHostOutput equals exactly this
+				// quantity; on a full-rollover refresh FinalHostOutput
+				// is zero. wellFormedV2Contract guarantees the subtraction
+				// is safe.
+				cr.HostEarnedRevenue = fc.RiskedHostRevenue()
 				// The renter-side spend telescopes naturally: the rolled-over
 				// allowance is removed from this contract's Locked here and
 				// re-added by the new contract's formation entry, and the new
