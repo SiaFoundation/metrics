@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"time"
 
-	"go.sia.tech/core/consensus"
 	"go.sia.tech/core/types"
 	"go.sia.tech/jape"
 	"go.sia.tech/metrics/metrics"
@@ -15,7 +14,6 @@ import (
 type (
 	// Chain defines the interface for accessing blockchain state.
 	Chain interface {
-		TipState() consensus.State
 		Tip() types.ChainIndex
 	}
 
@@ -30,6 +28,8 @@ type (
 
 		HostsCount(context.Context, time.Time, time.Time) (int64, error)
 		RentersCount(context.Context, time.Time, time.Time) (int64, error)
+		NewHosts(context.Context, time.Time, time.Time) (int64, error)
+		NewRenters(context.Context, time.Time, time.Time) (int64, error)
 
 		HostMetrics(context.Context, types.PublicKey, time.Time, time.Time) ([]metrics.Host, error)
 		RenterMetrics(context.Context, types.PublicKey, time.Time, time.Time) ([]metrics.Renter, error)
@@ -120,6 +120,64 @@ func (a *api) handleMetrics(jc jape.Context) {
 	jc.Encode(ms)
 }
 
+// handleHostMetrics returns the per-host metrics time series in [start, end].
+// Bounds default to the last 30 days truncated to the hour, matching the
+// /metrics endpoint. Snapshots are hourly, ordered by timestamp ascending.
+func (a *api) handleHostMetrics(jc jape.Context) {
+	ctx := jc.Request.Context()
+	var hostKey types.PublicKey
+	if err := jc.DecodeParam("key", &hostKey); err != nil {
+		return
+	}
+
+	end := time.Now().Truncate(time.Hour)
+	start := end.AddDate(0, -1, 0)
+	if err := jc.DecodeForm("start", &start); err != nil {
+		return
+	}
+	if err := jc.DecodeForm("end", &end); err != nil {
+		return
+	}
+	if !end.After(start) {
+		jc.Error(errors.New("end must be after start"), http.StatusBadRequest)
+		return
+	}
+
+	hs, err := a.metrics.HostMetrics(ctx, hostKey, start, end)
+	if jc.Check("failed to get host metrics", err) != nil {
+		return
+	}
+	jc.Encode(hs)
+}
+
+// handleRenterMetrics mirrors handleHostMetrics for renters.
+func (a *api) handleRenterMetrics(jc jape.Context) {
+	ctx := jc.Request.Context()
+	var renterKey types.PublicKey
+	if err := jc.DecodeParam("key", &renterKey); err != nil {
+		return
+	}
+
+	end := time.Now().Truncate(time.Hour)
+	start := end.AddDate(0, -1, 0)
+	if err := jc.DecodeForm("start", &start); err != nil {
+		return
+	}
+	if err := jc.DecodeForm("end", &end); err != nil {
+		return
+	}
+	if !end.After(start) {
+		jc.Error(errors.New("end must be after start"), http.StatusBadRequest)
+		return
+	}
+
+	rs, err := a.metrics.RenterMetrics(ctx, renterKey, start, end)
+	if jc.Check("failed to get renter metrics", err) != nil {
+		return
+	}
+	jc.Encode(rs)
+}
+
 func (a *api) handleTopHosts(jc jape.Context) {
 	ctx := jc.Request.Context()
 	end := time.Now().Truncate(time.Hour)
@@ -162,13 +220,20 @@ func (a *api) handleSummary(jc jape.Context) {
 		return
 	}
 
-	hosts, err := a.metrics.HostsCount(ctx, start, end)
-	if jc.Check("failed to get hosts count", err) != nil {
+	activeHosts, err := a.metrics.HostsCount(ctx, start, end)
+	if jc.Check("failed to get active hosts count", err) != nil {
 		return
 	}
-
-	renters, err := a.metrics.RentersCount(ctx, start, end)
-	if jc.Check("failed to get renters count", err) != nil {
+	activeRenters, err := a.metrics.RentersCount(ctx, start, end)
+	if jc.Check("failed to get active renters count", err) != nil {
+		return
+	}
+	newHosts, err := a.metrics.NewHosts(ctx, start, end)
+	if jc.Check("failed to get new hosts count", err) != nil {
+		return
+	}
+	newRenters, err := a.metrics.NewRenters(ctx, start, end)
+	if jc.Check("failed to get new renters count", err) != nil {
 		return
 	}
 
@@ -176,7 +241,6 @@ func (a *api) handleSummary(jc jape.Context) {
 	if jc.Check("failed to get last global metrics", err) != nil {
 		return
 	}
-
 	first, err := a.metrics.GlobalMetric(ctx, start)
 	if jc.Check("failed to get first global metrics", err) != nil {
 		return
@@ -186,13 +250,22 @@ func (a *api) handleSummary(jc jape.Context) {
 	firstTotalContracts := first.ActiveContracts + first.FailedContracts + first.RenewedContracts + first.SuccessfulContracts
 
 	jc.Encode(UsageSummaryResponse{
-		ActiveHosts:   uint64(hosts),
-		ActiveRenters: uint64(renters),
-		NewHosts:      uint64(last.Hosts - first.Hosts),
-		NewRenters:    uint64(last.Renters - first.Renters),
+		ActiveHosts:   uint64(activeHosts),
+		ActiveRenters: uint64(activeRenters),
+		NewHosts:      uint64(newHosts),
+		NewRenters:    uint64(newRenters),
 
-		RenterSpending: last.SpentAllowance.Sub(first.SpentAllowance),
-		NewContracts:   lastTotalContracts - firstTotalContracts,
+		NewContracts:      lastTotalContracts - firstTotalContracts,
+		Transactions:      last.TransactionCount - first.TransactionCount,
+		Revisions:         last.RevisionCount - first.RevisionCount,
+		BytesUploaded:     last.BytesUploaded - first.BytesUploaded,
+		ActiveByteDays:    last.ActiveByteDays - first.ActiveByteDays,
+		RenterSpending:    last.SpentAllowance.Sub(first.SpentAllowance),
+		HostEarnedRevenue: last.EarnedRevenue.Sub(first.EarnedRevenue),
+		BurntCollateral:   last.BurntCollateral.Sub(first.BurntCollateral),
+		Tax:               last.Tax.Sub(first.Tax),
+
+		TVL: last.LockedAllowance.Add(last.LockedCollateral),
 
 		Start: start,
 		End:   end,
@@ -290,7 +363,9 @@ func NewHandler(chain Chain, metrics Metrics) http.Handler {
 		"GET /top/hosts":                a.handleTopHosts,
 		"GET /top/renters":              a.handleTopRenters,
 		"GET /hosts/:key/last":          a.handleHostsKeyLast,
+		"GET /hosts/:key/metrics":       a.handleHostMetrics,
 		"GET /renters/:key/last":        a.handleRentersKeyLast,
+		"GET /renters/:key/metrics":     a.handleRenterMetrics,
 		"GET /metrics":                  a.handleMetrics,
 		"GET /metrics/last":             a.handleMetricsLast,
 		"GET /delta/:days/hosts/:key":   a.handleDeltaDaysHosts,

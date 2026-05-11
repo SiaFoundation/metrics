@@ -707,8 +707,29 @@ ORDER BY date_created DESC LIMIT 1;`, sqlTime(timestamp))
 }
 
 func insertHostMetrics(ctx context.Context, tx *txn, m metrics.Host) error {
-	_, err := tx.Exec(ctx, `INSERT OR REPLACE INTO host_metrics (host_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, revision_count, active_size, total_size, bytes_uploaded, burnt_collateral, locked_collateral, risked_collateral, potential_revenue, earned_revenue, first_seen, last_active, date_created)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17);`,
+	// UPSERT on the (host_key, date_created) primary key so an in-place
+	// update is performed when a row already exists for the snapshot hour,
+	// instead of INSERT OR REPLACE's delete-then-insert (which fires CHECK
+	// constraints from scratch and would invalidate any future foreign-key
+	// references to the row).
+	_, err := tx.Exec(ctx, `INSERT INTO host_metrics (host_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, revision_count, active_size, total_size, bytes_uploaded, burnt_collateral, locked_collateral, risked_collateral, potential_revenue, earned_revenue, first_seen, last_active, date_created)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+ON CONFLICT(host_key, date_created) DO UPDATE SET
+	active_contracts = excluded.active_contracts,
+	renewed_contracts = excluded.renewed_contracts,
+	successful_contracts = excluded.successful_contracts,
+	failed_contracts = excluded.failed_contracts,
+	revision_count = excluded.revision_count,
+	active_size = excluded.active_size,
+	total_size = excluded.total_size,
+	bytes_uploaded = excluded.bytes_uploaded,
+	burnt_collateral = excluded.burnt_collateral,
+	locked_collateral = excluded.locked_collateral,
+	risked_collateral = excluded.risked_collateral,
+	potential_revenue = excluded.potential_revenue,
+	earned_revenue = excluded.earned_revenue,
+	first_seen = excluded.first_seen,
+	last_active = excluded.last_active;`,
 		sqlHash256(m.PublicKey),
 		m.ActiveContracts,
 		m.RenewedContracts,
@@ -730,8 +751,22 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $
 }
 
 func insertRenterMetrics(ctx context.Context, tx *txn, m metrics.Renter) error {
-	_, err := tx.Exec(ctx, `INSERT OR REPLACE INTO renter_metrics (renter_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, revision_count, active_size, total_size, bytes_uploaded, locked_allowance, spent_allowance, tax, first_seen, last_active, date_created)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15);`,
+	_, err := tx.Exec(ctx, `INSERT INTO renter_metrics (renter_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, revision_count, active_size, total_size, bytes_uploaded, locked_allowance, spent_allowance, tax, first_seen, last_active, date_created)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+ON CONFLICT(renter_key, date_created) DO UPDATE SET
+	active_contracts = excluded.active_contracts,
+	renewed_contracts = excluded.renewed_contracts,
+	successful_contracts = excluded.successful_contracts,
+	failed_contracts = excluded.failed_contracts,
+	revision_count = excluded.revision_count,
+	active_size = excluded.active_size,
+	total_size = excluded.total_size,
+	bytes_uploaded = excluded.bytes_uploaded,
+	locked_allowance = excluded.locked_allowance,
+	spent_allowance = excluded.spent_allowance,
+	tax = excluded.tax,
+	first_seen = excluded.first_seen,
+	last_active = excluded.last_active;`,
 		sqlHash256(m.PublicKey),
 		m.ActiveContracts,
 		m.RenewedContracts,
@@ -751,10 +786,31 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15);`,
 }
 
 func insertMetrics(ctx context.Context, tx *txn, m metrics.Metrics) error {
-	_, err := tx.Exec(ctx, `INSERT OR REPLACE INTO metrics (renters, hosts, active_contracts,
+	_, err := tx.Exec(ctx, `INSERT INTO metrics (renters, hosts, active_contracts,
 renewed_contracts, successful_contracts, failed_contracts, v2_transaction_count, revision_count, active_size, total_size, bytes_uploaded, active_byte_days, spent_allowance, locked_allowance, tax,
 potential_revenue, earned_revenue, locked_collateral, risked_collateral, burnt_collateral, date_created)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21);`,
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+ON CONFLICT(date_created) DO UPDATE SET
+	renters = excluded.renters,
+	hosts = excluded.hosts,
+	active_contracts = excluded.active_contracts,
+	renewed_contracts = excluded.renewed_contracts,
+	successful_contracts = excluded.successful_contracts,
+	failed_contracts = excluded.failed_contracts,
+	v2_transaction_count = excluded.v2_transaction_count,
+	revision_count = excluded.revision_count,
+	active_size = excluded.active_size,
+	total_size = excluded.total_size,
+	bytes_uploaded = excluded.bytes_uploaded,
+	active_byte_days = excluded.active_byte_days,
+	spent_allowance = excluded.spent_allowance,
+	locked_allowance = excluded.locked_allowance,
+	tax = excluded.tax,
+	potential_revenue = excluded.potential_revenue,
+	earned_revenue = excluded.earned_revenue,
+	locked_collateral = excluded.locked_collateral,
+	risked_collateral = excluded.risked_collateral,
+	burnt_collateral = excluded.burnt_collateral;`,
 		m.Renters,
 		m.Hosts,
 		m.ActiveContracts,
