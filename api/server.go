@@ -148,6 +148,19 @@ func (a *api) handleSummary(jc jape.Context) {
 	ctx := jc.Request.Context()
 	end := time.Now().Truncate(time.Hour)
 	start := end.AddDate(0, -1, 0) // one month ago
+	// Optional start/end query params let callers request a summary over a
+	// custom window so the values can be aligned with /metrics?start=...&end=...
+	// for the same period. Bounds default to the prior 30-day behavior.
+	if err := jc.DecodeForm("start", &start); err != nil {
+		return
+	}
+	if err := jc.DecodeForm("end", &end); err != nil {
+		return
+	}
+	if !end.After(start) {
+		jc.Error(errors.New("end must be after start"), http.StatusBadRequest)
+		return
+	}
 
 	hosts, err := a.metrics.HostsCount(ctx, start, end)
 	if jc.Check("failed to get hosts count", err) != nil {
