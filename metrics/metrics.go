@@ -18,6 +18,14 @@ const (
 	ResolutionTypeProof = iota + 1
 	ResolutionTypeExpired
 	ResolutionTypeRenewed
+	// ResolutionTypeAbandoned is a metric-only resolution emitted when a
+	// previously-tracked v2 file contract transitions to a malformed state
+	// (one the metric model can't follow — see wellFormedV2Contract). The
+	// contract may still resolve on chain at some future point, but the
+	// indexer can't safely apply further events to it, so it is removed
+	// from active counters here. No success/failure/renewed classification
+	// is attributed; HostBurn and HostEarnedRevenue remain zero.
+	ResolutionTypeAbandoned
 )
 
 const blockPruneDays = 7
@@ -285,13 +293,21 @@ var (
 )
 
 // wellFormedV2Contract reports whether a v2 file contract fits the standard
-// payout decomposition assumed by the metrics (MissedHostValue ≤ TotalCollateral
-// ≤ HostOutput.Value). Consensus only enforces the second inequality, so a
-// hand-crafted or non-standard contract can legitimately violate the first —
-// in which case fc.RiskedCollateral() underflows. We treat such contracts as
-// malformed and skip them for metric purposes.
+// payout decomposition assumed by the metrics: MissedHostValue ≤ TotalCollateral
+// ≤ HostOutput.Value. Consensus enforces the second inequality only at
+// formation (not on revisions) and never enforces the first, so a hand-crafted
+// or non-standard contract — or a contract revised in a way that redistributes
+// value from HostOutput.Value to RenterOutput.Value — can validly violate
+// either. The metric model relies on both inequalities to avoid Currency.Sub
+// underflows in:
+//   - fc.RiskedCollateral()       = TotalCollateral − MissedHostValue
+//   - fc.RiskedHostRevenue()      = HostOutput.Value − TotalCollateral
+//   - HostOutput.Value − MissedHostValue (used as HostBurn at expiration)
+//
+// Contracts that fail either inequality are skipped for metric purposes.
 func wellFormedV2Contract(fc types.V2FileContract) bool {
-	return fc.MissedHostValue.Cmp(fc.TotalCollateral) <= 0
+	return fc.MissedHostValue.Cmp(fc.TotalCollateral) <= 0 &&
+		fc.TotalCollateral.Cmp(fc.HostOutput.Value) <= 0
 }
 
 func parseDiffs(timestamp time.Time, cs consensus.State, diffs []consensus.V2FileContractElementDiff, log *zap.Logger) (State, error) {
@@ -338,6 +354,33 @@ func parseDiffs(timestamp time.Time, cs consensus.State, diffs []consensus.V2Fil
 			})
 			log.Debug("contract formation", zap.Stringer("host", fc.HostPublicKey), zap.Stringer("renter", fc.RenterPublicKey), zap.Stringer("allowance", fc.RemainingAllowance()), zap.Stringer("contractPrice", renterContractPrice), zap.Stringer("tax", renterTax), zap.Stringer("collateral", fc.RiskedCollateral()), zap.Stringer("revenue", fc.RiskedHostRevenue()))
 		} else if rev, ok := diff.V2RevisionElement(); ok {
+			// The parent fc passed wellFormedV2Contract above, but a revision
+			// can redistribute HostOutput.Value into RenterOutput.Value (while
+			// preserving their sum), which consensus does not check against
+			// TotalCollateral. If the revision lands in a state where
+			// TotalCollateral > HostOutput.Value, rev.RiskedHostRevenue() would
+			// underflow. We can't safely record this revision and won't be
+			// able to safely process any subsequent diffs for this contract
+			// either (the parent fc on the next block will be malformed and
+			// fail the top-of-loop check). Synthesize an abandonment
+			// resolution so the contract stops being counted as active. We
+			// use the last well-formed state (fc) as the basis for the
+			// counters being released; HostBurn and HostEarnedRevenue stay
+			// zero because no actual chain settlement occurred.
+			if !wellFormedV2Contract(rev.V2FileContract) {
+				log.Warn("abandoning v2 contract after malformed revision", zap.Stringer("missedHostValue", rev.V2FileContract.MissedHostValue), zap.Stringer("totalCollateral", rev.V2FileContract.TotalCollateral), zap.Stringer("hostOutput", rev.V2FileContract.HostOutput.Value))
+				state.Resolutions = append(state.Resolutions, ContractResolution{
+					Host:                 fc.HostPublicKey,
+					Renter:               fc.RenterPublicKey,
+					Size:                 fc.Filesize,
+					Type:                 ResolutionTypeAbandoned,
+					RenterAllowance:      fc.RemainingAllowance(),
+					HostLockedCollateral: fc.TotalCollateral,
+					HostRiskedCollateral: fc.RiskedCollateral(),
+					HostPotentialRevenue: fc.RiskedHostRevenue(),
+				})
+				continue
+			}
 			state.Revisions = append(state.Revisions, ContractRevision{
 				Host:   fc.HostPublicKey,
 				Renter: fc.RenterPublicKey,
@@ -376,8 +419,22 @@ func parseDiffs(timestamp time.Time, cs consensus.State, diffs []consensus.V2Fil
 				cr.Type = ResolutionTypeProof
 				cr.HostEarnedRevenue = fc.RiskedHostRevenue()
 			case *types.V2FileContractRenewal:
+				// Consensus runs validateContract on the renewal's new
+				// contract (enforcing TotalCollateral ≤ HostOutput.Value)
+				// but does not enforce MissedHostValue ≤ TotalCollateral,
+				// so the new contract can still fail wellFormedV2Contract.
+				// In that case the new contract will be skipped at its
+				// own Created diff, leaving the lineage untrackable. We
+				// classify this as an abandonment rather than a renewal
+				// so we don't credit RenewedContracts for a renewal whose
+				// successor we can't account for. Active-counter releases
+				// for the old contract still apply (handled in sqlite).
+				if !wellFormedV2Contract(res.NewContract) {
+					log.Warn("abandoning v2 contract: renewal produced malformed new contract", zap.Stringer("missedHostValue", res.NewContract.MissedHostValue), zap.Stringer("totalCollateral", res.NewContract.TotalCollateral), zap.Stringer("hostOutput", res.NewContract.HostOutput.Value))
+					cr.Type = ResolutionTypeAbandoned
+					break
+				}
 				cr.Type = ResolutionTypeRenewed
-
 				if res.FinalHostOutput.Value.Cmp(fc.TotalCollateral) > 0 {
 					cr.HostEarnedRevenue = res.FinalHostOutput.Value.Sub(fc.TotalCollateral)
 				}
