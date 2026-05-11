@@ -68,6 +68,8 @@ func main() {
 	case "zen":
 		n, genesis = chain.TestnetZen()
 		peers = syncer.ZenBootstrapPeers
+	default:
+		log.Panic("unsupported network", zap.String("network", network))
 	}
 
 	db, err := coreutils.OpenBoltChainDB(filepath.Join(dir, "consensus.db"))
@@ -89,21 +91,18 @@ func main() {
 	}
 	defer syncerListener.Close()
 
-	s := syncer.New(syncerListener, cm, testutil.NewEphemeralPeerStore(), gateway.Header{
+	ps := testutil.NewEphemeralPeerStore()
+	for _, p := range peers {
+		ps.AddPeer(p)
+	}
+
+	s := syncer.New(syncerListener, cm, ps, gateway.Header{
 		GenesisID:  genesis.ID(),
 		UniqueID:   gateway.GenerateUniqueID(),
 		NetAddress: net.JoinHostPort("127.0.0.1", "9981"),
 	}, syncer.WithLogger(log.Named("syncer")))
 	defer s.Close()
 	go s.Run()
-
-	for _, peer := range peers {
-		go func(peer string) {
-			if _, err := s.Connect(context.Background(), peer); err != nil {
-				log.Error("failed to connect to peer", zap.String("peer", peer), zap.Error(err))
-			}
-		}(peer)
-	}
 
 	metrics, err := metrics.NewManager(cm, store, log.Named("metrics"))
 	if err != nil {

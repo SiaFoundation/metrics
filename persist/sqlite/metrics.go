@@ -12,6 +12,22 @@ import (
 	"go.uber.org/zap"
 )
 
+// secondsPerDay is used as the denominator when accumulating byte-days from
+// per-block (activeSize, blockInterval) contributions.
+const secondsPerDay = 24 * 60 * 60
+
+// byteDaysDelta returns the byte-days attributable to a single block holding
+// `activeSize` bytes for `blockInterval` of time. It approximates the integral
+// of ActiveSize over time as a Riemann sum (one rectangle per block) at
+// second-granularity; sub-second block intervals truncate to zero.
+func byteDaysDelta(activeSize uint64, blockInterval time.Duration) uint64 {
+	seconds := uint64(blockInterval / time.Second)
+	if seconds == 0 {
+		return 0
+	}
+	return activeSize * seconds / secondsPerDay
+}
+
 // LastIndexedTip retrieves the last indexed tip from the store.
 func (s *Store) LastIndexedTip(ctx context.Context) (index types.ChainIndex, err error) {
 	err = s.transaction(ctx, func(ctx context.Context, tx *txn) error {
@@ -30,6 +46,21 @@ func (s *Store) LastIndexedTip(ctx context.Context) (index types.ChainIndex, err
 // RevertState reverts the store to a previous state based on the provided tip and state.
 func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state metrics.State) error {
 	return s.transaction(ctx, func(ctx context.Context, tx *txn) error {
+		// Reverse the block-level updates from ApplyState before processing
+		// the event-level reverts. At this point gm.ActiveSize still reflects
+		// the post-block state (set by the apply we are reverting), which is
+		// the same value ApplyState used when accumulating byte-days, so the
+		// subtraction is symmetric.
+		gm, err := getMetrics(ctx, tx, state.Timestamp)
+		if err != nil {
+			return fmt.Errorf("failed to get global metrics: %w", err)
+		}
+		gm.TransactionCount -= state.V2TransactionCount
+		gm.ActiveByteDays -= byteDaysDelta(gm.ActiveSize, state.BlockInterval)
+		if err := insertMetrics(ctx, tx, gm); err != nil {
+			return fmt.Errorf("failed to insert global metrics: %w", err)
+		}
+
 		for _, formation := range state.Formations {
 			gm, err := getMetrics(ctx, tx, state.Timestamp)
 			if err != nil {
@@ -37,9 +68,12 @@ func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state met
 			}
 			gm.ActiveContracts--
 			gm.LockedAllowance = gm.LockedAllowance.Sub(formation.RenterAllowance)
+			gm.SpentAllowance = gm.SpentAllowance.Sub(formation.RenterContractPrice)
+			gm.Tax = gm.Tax.Sub(formation.RenterTax)
 			gm.PotentialRevenue = gm.PotentialRevenue.Sub(formation.HostPotentialRevenue)
 			gm.LockedCollateral = gm.LockedCollateral.Sub(formation.HostLockedCollateral)
 			gm.RiskedCollateral = gm.RiskedCollateral.Sub(formation.HostRiskedCollateral)
+			gm.BytesUploaded -= formation.Size
 
 			hm, err := getHostMetrics(ctx, tx, formation.Host, state.Timestamp)
 			if err != nil {
@@ -48,6 +82,7 @@ func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state met
 			hm.ActiveContracts--
 			hm.ActiveSize -= formation.Size
 			hm.TotalSize -= formation.Size
+			hm.BytesUploaded -= formation.Size
 			hm.LockedCollateral = hm.LockedCollateral.Sub(formation.HostLockedCollateral)
 			hm.RiskedCollateral = hm.RiskedCollateral.Sub(formation.HostRiskedCollateral)
 			hm.PotentialRevenue = hm.PotentialRevenue.Sub(formation.HostPotentialRevenue)
@@ -59,7 +94,10 @@ func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state met
 			rm.ActiveContracts--
 			rm.ActiveSize -= formation.Size
 			rm.TotalSize -= formation.Size
+			rm.BytesUploaded -= formation.Size
 			rm.Locked = rm.Locked.Sub(formation.RenterAllowance)
+			rm.Spent = rm.Spent.Sub(formation.RenterContractPrice)
+			rm.Tax = rm.Tax.Sub(formation.RenterTax)
 
 			if err := insertMetrics(ctx, tx, gm); err != nil {
 				return fmt.Errorf("failed to insert global metrics: %w", err)
@@ -75,6 +113,12 @@ func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state met
 			if !ok {
 				spent = types.ZeroCurrency
 			}
+			// Mirror the Apply-side guard: only grow revisions contributed
+			// to BytesUploaded, so we only undo that contribution on revert.
+			var grewBy uint64
+			if revision.NewSize > revision.ExistingSize {
+				grewBy = revision.NewSize - revision.ExistingSize
+			}
 
 			hm, err := getHostMetrics(ctx, tx, revision.Host, state.Timestamp)
 			if err != nil {
@@ -84,6 +128,8 @@ func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state met
 			hm.PotentialRevenue = hm.PotentialRevenue.Sub(revision.NewPotentialRevenue).Add(revision.ExistingPotentialRevenue)
 			hm.ActiveSize = hm.ActiveSize - revision.NewSize + revision.ExistingSize
 			hm.TotalSize = hm.TotalSize - revision.NewSize + revision.ExistingSize
+			hm.BytesUploaded -= grewBy
+			hm.RevisionCount--
 
 			rm, err := getRenterMetrics(ctx, tx, revision.Renter, state.Timestamp)
 			if err != nil {
@@ -91,8 +137,10 @@ func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state met
 			}
 			rm.ActiveSize = rm.ActiveSize - revision.NewSize + revision.ExistingSize
 			rm.TotalSize = rm.TotalSize - revision.NewSize + revision.ExistingSize
+			rm.BytesUploaded -= grewBy
 			rm.Locked = rm.Locked.Sub(revision.NewAllowance).Add(revision.ExistingAllowance)
 			rm.Spent = rm.Spent.Sub(spent)
+			rm.RevisionCount--
 
 			gm, err := getMetrics(ctx, tx, state.Timestamp)
 			if err != nil {
@@ -100,10 +148,12 @@ func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state met
 			}
 			gm.ActiveSize = gm.ActiveSize - revision.NewSize + revision.ExistingSize
 			gm.TotalSize = gm.TotalSize - revision.NewSize + revision.ExistingSize
+			gm.BytesUploaded -= grewBy
 			gm.LockedAllowance = gm.LockedAllowance.Sub(revision.NewAllowance).Add(revision.ExistingAllowance)
 			gm.PotentialRevenue = gm.PotentialRevenue.Sub(revision.NewPotentialRevenue).Add(revision.ExistingPotentialRevenue)
 			gm.RiskedCollateral = gm.RiskedCollateral.Sub(revision.NewRiskedCollateral).Add(revision.ExistingRiskedCollateral)
 			gm.SpentAllowance = gm.SpentAllowance.Sub(spent)
+			gm.RevisionCount--
 
 			if err := insertMetrics(ctx, tx, gm); err != nil {
 				return fmt.Errorf("failed to insert global metrics: %w", err)
@@ -134,14 +184,12 @@ func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state met
 			rm.ActiveContracts++
 			rm.ActiveSize += resolution.Size
 			rm.Locked = rm.Locked.Add(resolution.RenterAllowance)
-			rm.Spent = rm.Spent.Sub(resolution.RenterSpent)
 
 			gm, err := getMetrics(ctx, tx, state.Timestamp)
 			if err != nil {
 				return fmt.Errorf("failed to get global metrics: %w", err)
 			}
 			gm.ActiveContracts++
-			gm.SpentAllowance = gm.SpentAllowance.Sub(resolution.RenterSpent)
 			gm.LockedAllowance = gm.LockedAllowance.Add(resolution.RenterAllowance)
 			gm.EarnedRevenue = gm.EarnedRevenue.Sub(resolution.HostEarnedRevenue)
 			gm.BurntCollateral = gm.BurntCollateral.Sub(resolution.HostBurn)
@@ -155,7 +203,9 @@ func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state met
 				rm.SuccessfulContracts--
 				gm.SuccessfulContracts--
 			case metrics.ResolutionTypeExpired:
-				if hm.BurntCollateral.IsZero() {
+				// Mirror the Apply classification: check this resolution's
+				// HostBurn, not the host's cumulative BurntCollateral.
+				if resolution.HostBurn.IsZero() {
 					hm.SuccessfulContracts--
 					rm.SuccessfulContracts--
 					gm.SuccessfulContracts--
@@ -179,7 +229,7 @@ func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state met
 			}
 		}
 
-		_, err := tx.Exec(ctx, `UPDATE global_settings SET last_index = $1;`, encodable(tip))
+		_, err = tx.Exec(ctx, `UPDATE global_settings SET last_index = $1;`, encodable(tip))
 		return err
 	})
 }
@@ -195,7 +245,10 @@ func (s *Store) ApplyState(ctx context.Context, tip types.ChainIndex, state metr
 			gm.ActiveContracts++
 			gm.ActiveSize += formation.Size
 			gm.TotalSize += formation.Size
+			gm.BytesUploaded += formation.Size
 			gm.LockedAllowance = gm.LockedAllowance.Add(formation.RenterAllowance)
+			gm.SpentAllowance = gm.SpentAllowance.Add(formation.RenterContractPrice)
+			gm.Tax = gm.Tax.Add(formation.RenterTax)
 			gm.PotentialRevenue = gm.PotentialRevenue.Add(formation.HostPotentialRevenue)
 			gm.LockedCollateral = gm.LockedCollateral.Add(formation.HostLockedCollateral)
 			gm.RiskedCollateral = gm.RiskedCollateral.Add(formation.HostRiskedCollateral)
@@ -210,9 +263,14 @@ func (s *Store) ApplyState(ctx context.Context, tip types.ChainIndex, state metr
 			hm.ActiveContracts++
 			hm.ActiveSize += formation.Size
 			hm.TotalSize += formation.Size
+			hm.BytesUploaded += formation.Size
 			hm.LockedCollateral = hm.LockedCollateral.Add(formation.HostLockedCollateral)
 			hm.RiskedCollateral = hm.RiskedCollateral.Add(formation.HostRiskedCollateral)
 			hm.PotentialRevenue = hm.PotentialRevenue.Add(formation.HostPotentialRevenue)
+			if hm.FirstSeen.IsZero() {
+				hm.FirstSeen = state.Timestamp
+			}
+			hm.LastActive = state.Timestamp
 			s.log.Debug("updating host metrics for formation", zap.Stringer("host", hm.PublicKey), zap.Any("after", hm))
 
 			rm, err := getRenterMetrics(ctx, tx, formation.Renter, state.Timestamp)
@@ -225,7 +283,14 @@ func (s *Store) ApplyState(ctx context.Context, tip types.ChainIndex, state metr
 			rm.ActiveContracts++
 			rm.ActiveSize += formation.Size
 			rm.TotalSize += formation.Size
+			rm.BytesUploaded += formation.Size
 			rm.Locked = rm.Locked.Add(formation.RenterAllowance)
+			rm.Spent = rm.Spent.Add(formation.RenterContractPrice)
+			rm.Tax = rm.Tax.Add(formation.RenterTax)
+			if rm.FirstSeen.IsZero() {
+				rm.FirstSeen = state.Timestamp
+			}
+			rm.LastActive = state.Timestamp
 			s.log.Debug("updating renter metrics for formation", zap.Stringer("renter", rm.PublicKey), zap.Any("after", rm))
 
 			if err := insertMetrics(ctx, tx, gm); err != nil {
@@ -238,6 +303,14 @@ func (s *Store) ApplyState(ctx context.Context, tip types.ChainIndex, state metr
 		}
 
 		for _, revision := range state.Revisions {
+			// Only count positive size deltas toward BytesUploaded so it
+			// remains monotonic. Shrinks update Active/TotalSize but not
+			// the upload counter.
+			var grewBy uint64
+			if revision.NewSize > revision.ExistingSize {
+				grewBy = revision.NewSize - revision.ExistingSize
+			}
+
 			hm, err := getHostMetrics(ctx, tx, revision.Host, state.Timestamp)
 			if err != nil {
 				return fmt.Errorf("failed to get revision host metrics for %q: %w", revision.Host, err)
@@ -247,6 +320,12 @@ func (s *Store) ApplyState(ctx context.Context, tip types.ChainIndex, state metr
 			hm.PotentialRevenue = hm.PotentialRevenue.Sub(revision.ExistingPotentialRevenue).Add(revision.NewPotentialRevenue)
 			hm.ActiveSize = hm.ActiveSize - revision.ExistingSize + revision.NewSize
 			hm.TotalSize = hm.TotalSize - revision.ExistingSize + revision.NewSize
+			hm.BytesUploaded += grewBy
+			hm.RevisionCount++
+			if hm.FirstSeen.IsZero() {
+				hm.FirstSeen = state.Timestamp
+			}
+			hm.LastActive = state.Timestamp
 			s.log.Debug("updating host metrics for revision", zap.Stringer("host", hm.PublicKey), zap.Any("after", hm))
 
 			rm, err := getRenterMetrics(ctx, tx, revision.Renter, state.Timestamp)
@@ -259,8 +338,14 @@ func (s *Store) ApplyState(ctx context.Context, tip types.ChainIndex, state metr
 			}
 			rm.ActiveSize = rm.ActiveSize - revision.ExistingSize + revision.NewSize
 			rm.TotalSize = rm.TotalSize - revision.ExistingSize + revision.NewSize
+			rm.BytesUploaded += grewBy
 			rm.Locked = rm.Locked.Sub(revision.ExistingAllowance).Add(revision.NewAllowance)
 			rm.Spent = rm.Spent.Add(spent)
+			rm.RevisionCount++
+			if rm.FirstSeen.IsZero() {
+				rm.FirstSeen = state.Timestamp
+			}
+			rm.LastActive = state.Timestamp
 			s.log.Debug("updating renter metrics for revision", zap.Stringer("renter", rm.PublicKey), zap.Stringer("spent", spent))
 
 			gm, err := getMetrics(ctx, tx, state.Timestamp)
@@ -269,10 +354,12 @@ func (s *Store) ApplyState(ctx context.Context, tip types.ChainIndex, state metr
 			}
 			gm.ActiveSize = gm.ActiveSize - revision.ExistingSize + revision.NewSize
 			gm.TotalSize = gm.TotalSize - revision.ExistingSize + revision.NewSize
+			gm.BytesUploaded += grewBy
 			gm.LockedAllowance = gm.LockedAllowance.Sub(revision.ExistingAllowance).Add(revision.NewAllowance)
 			gm.PotentialRevenue = gm.PotentialRevenue.Sub(revision.ExistingPotentialRevenue).Add(revision.NewPotentialRevenue)
 			gm.RiskedCollateral = gm.RiskedCollateral.Sub(revision.ExistingRiskedCollateral).Add(revision.NewRiskedCollateral)
 			gm.SpentAllowance = gm.SpentAllowance.Add(spent)
+			gm.RevisionCount++
 
 			if err := insertMetrics(ctx, tx, gm); err != nil {
 				return fmt.Errorf("failed to insert global metrics: %w", err)
@@ -296,6 +383,10 @@ func (s *Store) ApplyState(ctx context.Context, tip types.ChainIndex, state metr
 			hm.LockedCollateral = hm.LockedCollateral.Sub(resolution.HostLockedCollateral)
 			hm.RiskedCollateral = hm.RiskedCollateral.Sub(resolution.HostRiskedCollateral)
 			hm.PotentialRevenue = hm.PotentialRevenue.Sub(resolution.HostPotentialRevenue)
+			if hm.FirstSeen.IsZero() {
+				hm.FirstSeen = state.Timestamp
+			}
+			hm.LastActive = state.Timestamp
 
 			rm, err := getRenterMetrics(ctx, tx, resolution.Renter, state.Timestamp)
 			if err != nil {
@@ -305,7 +396,10 @@ func (s *Store) ApplyState(ctx context.Context, tip types.ChainIndex, state metr
 			rm.ActiveContracts--
 			rm.ActiveSize -= resolution.Size
 			rm.Locked = rm.Locked.Sub(resolution.RenterAllowance)
-			rm.Spent = rm.Spent.Add(resolution.RenterSpent)
+			if rm.FirstSeen.IsZero() {
+				rm.FirstSeen = state.Timestamp
+			}
+			rm.LastActive = state.Timestamp
 			s.log.Debug("updating renter metrics for resolution", zap.Stringer("renter", rm.PublicKey), zap.Any("after", rm))
 
 			gm, err := getMetrics(ctx, tx, state.Timestamp)
@@ -313,7 +407,6 @@ func (s *Store) ApplyState(ctx context.Context, tip types.ChainIndex, state metr
 				return fmt.Errorf("failed to get global metrics: %w", err)
 			}
 			gm.ActiveContracts--
-			gm.SpentAllowance = gm.SpentAllowance.Add(resolution.RenterSpent)
 			gm.LockedAllowance = gm.LockedAllowance.Sub(resolution.RenterAllowance)
 			gm.EarnedRevenue = gm.EarnedRevenue.Add(resolution.HostEarnedRevenue)
 			gm.BurntCollateral = gm.BurntCollateral.Add(resolution.HostBurn)
@@ -327,7 +420,14 @@ func (s *Store) ApplyState(ctx context.Context, tip types.ChainIndex, state metr
 				rm.SuccessfulContracts++
 				gm.SuccessfulContracts++
 			case metrics.ResolutionTypeExpired:
-				if hm.BurntCollateral.IsZero() {
+				// An expiration is "successful" only if the host did not
+				// lose any of HostOutput.Value to the void on this contract.
+				// We must inspect *this* resolution's HostBurn, not the
+				// host's cumulative BurntCollateral — a host with prior
+				// burns would otherwise misclassify every later no-burn
+				// expiration as a failure for itself, its renters, and the
+				// network.
+				if resolution.HostBurn.IsZero() {
 					hm.SuccessfulContracts++
 					rm.SuccessfulContracts++
 					gm.SuccessfulContracts++
@@ -351,7 +451,22 @@ func (s *Store) ApplyState(ctx context.Context, tip types.ChainIndex, state metr
 			}
 		}
 
-		_, err := tx.Exec(ctx, `UPDATE global_settings SET last_index = $1;`, encodable(tip))
+		// Block-level updates run regardless of whether any v2 contract
+		// events occurred. We do this last so gm.ActiveSize reflects the
+		// post-event value, which is what we use to attribute byte-days
+		// to this block's interval. RevertState reads the same gm.ActiveSize
+		// at its start, so the subtraction stays symmetric.
+		gm, err := getMetrics(ctx, tx, state.Timestamp)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("failed to get global metrics: %w", err)
+		}
+		gm.TransactionCount += state.V2TransactionCount
+		gm.ActiveByteDays += byteDaysDelta(gm.ActiveSize, state.BlockInterval)
+		if err := insertMetrics(ctx, tx, gm); err != nil {
+			return fmt.Errorf("failed to insert global metrics: %w", err)
+		}
+
+		_, err = tx.Exec(ctx, `UPDATE global_settings SET last_index = $1;`, encodable(tip))
 		return err
 	})
 }
@@ -359,7 +474,7 @@ func (s *Store) ApplyState(ctx context.Context, tip types.ChainIndex, state metr
 // RenterMetric retrieves the latest renter metrics for a given renter key and timestamp.
 func (s *Store) RenterMetric(ctx context.Context, renterKey types.PublicKey, timestamp time.Time) (m metrics.Renter, err error) {
 	err = s.transaction(ctx, func(ctx context.Context, tx *txn) error {
-		row := tx.QueryRow(ctx, `SELECT renter_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, active_size, total_size, locked_allowance, spent_allowance, date_created
+		row := tx.QueryRow(ctx, `SELECT renter_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, revision_count, active_size, total_size, bytes_uploaded, locked_allowance, spent_allowance, tax, first_seen, last_active, date_created
 FROM renter_metrics WHERE renter_key=$1 AND date_created <= $2 ORDER BY date_created DESC LIMIT 1;`, sqlHash256(renterKey), sqlTime(timestamp))
 
 		m, err = scanRenter(row)
@@ -374,7 +489,7 @@ FROM renter_metrics WHERE renter_key=$1 AND date_created <= $2 ORDER BY date_cre
 // HostMetric retrieves the latest host metrics for a given host key and timestamp.
 func (s *Store) HostMetric(ctx context.Context, hostKey types.PublicKey, timestamp time.Time) (m metrics.Host, err error) {
 	err = s.transaction(ctx, func(ctx context.Context, tx *txn) error {
-		row := tx.QueryRow(ctx, `SELECT host_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, active_size, total_size, burnt_collateral, locked_collateral, risked_collateral, potential_revenue, earned_revenue, date_created
+		row := tx.QueryRow(ctx, `SELECT host_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, revision_count, active_size, total_size, bytes_uploaded, burnt_collateral, locked_collateral, risked_collateral, potential_revenue, earned_revenue, first_seen, last_active, date_created
 FROM host_metrics WHERE host_key=$1 AND date_created <= $2 ORDER BY date_created DESC LIMIT 1;`, sqlHash256(hostKey), sqlTime(timestamp))
 		m, err = scanHost(row)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -388,7 +503,7 @@ FROM host_metrics WHERE host_key=$1 AND date_created <= $2 ORDER BY date_created
 // GlobalMetric retrieves the latest global metrics for a given timestamp.
 func (s *Store) GlobalMetric(ctx context.Context, timestamp time.Time) (m metrics.Metrics, err error) {
 	err = s.transaction(ctx, func(ctx context.Context, tx *txn) error {
-		row := tx.QueryRow(ctx, `SELECT renters, hosts, active_contracts, renewed_contracts, successful_contracts, failed_contracts, active_size, total_size, spent_allowance, locked_allowance,
+		row := tx.QueryRow(ctx, `SELECT renters, hosts, active_contracts, renewed_contracts, successful_contracts, failed_contracts, v2_transaction_count, revision_count, active_size, total_size, bytes_uploaded, active_byte_days, spent_allowance, locked_allowance, tax,
 potential_revenue, earned_revenue, locked_collateral, risked_collateral, burnt_collateral, date_created
 FROM metrics WHERE date_created <= $1 ORDER BY date_created DESC LIMIT 1;`, sqlTime(timestamp))
 		m, err = scanMetrics(row)
@@ -400,7 +515,7 @@ FROM metrics WHERE date_created <= $1 ORDER BY date_created DESC LIMIT 1;`, sqlT
 // HostMetrics retrieves host metrics for a specific host key within a given time range.
 func (s *Store) HostMetrics(ctx context.Context, hostKey types.PublicKey, start, end time.Time) (ms []metrics.Host, err error) {
 	err = s.transaction(ctx, func(ctx context.Context, tx *txn) error {
-		rows, err := tx.Query(ctx, `SELECT host_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, active_size, total_size, burnt_collateral, locked_collateral, risked_collateral, potential_revenue, earned_revenue, date_created
+		rows, err := tx.Query(ctx, `SELECT host_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, revision_count, active_size, total_size, bytes_uploaded, burnt_collateral, locked_collateral, risked_collateral, potential_revenue, earned_revenue, first_seen, last_active, date_created
 FROM host_metrics WHERE host_key=$1 AND date_created BETWEEN $2 AND $3 ORDER BY date_created;`,
 			sqlHash256(hostKey), sqlTime(start), sqlTime(end))
 		if err != nil {
@@ -426,7 +541,7 @@ FROM host_metrics WHERE host_key=$1 AND date_created BETWEEN $2 AND $3 ORDER BY 
 // RenterMetrics retrieves renter metrics for a specific renter key within a given time range.
 func (s *Store) RenterMetrics(ctx context.Context, renterKey types.PublicKey, start, end time.Time) (ms []metrics.Renter, err error) {
 	err = s.transaction(ctx, func(ctx context.Context, tx *txn) error {
-		rows, err := tx.Query(ctx, `SELECT renter_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, active_size, total_size, locked_allowance, spent_allowance, date_created
+		rows, err := tx.Query(ctx, `SELECT renter_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, revision_count, active_size, total_size, bytes_uploaded, locked_allowance, spent_allowance, tax, first_seen, last_active, date_created
 FROM renter_metrics WHERE renter_key=$1 AND date_created BETWEEN $2 AND $3 ORDER BY date_created;`,
 			sqlHash256(renterKey), sqlTime(start), sqlTime(end))
 		if err != nil {
@@ -452,7 +567,7 @@ FROM renter_metrics WHERE renter_key=$1 AND date_created BETWEEN $2 AND $3 ORDER
 // GlobalMetrics retrieves global metrics within a specified time range.
 func (s *Store) GlobalMetrics(ctx context.Context, start, end time.Time) (ms []metrics.Metrics, err error) {
 	err = s.transaction(ctx, func(ctx context.Context, tx *txn) error {
-		rows, err := tx.Query(ctx, `SELECT renters, hosts, active_contracts, renewed_contracts, successful_contracts, failed_contracts, active_size, total_size, spent_allowance, locked_allowance,
+		rows, err := tx.Query(ctx, `SELECT renters, hosts, active_contracts, renewed_contracts, successful_contracts, failed_contracts, v2_transaction_count, revision_count, active_size, total_size, bytes_uploaded, active_byte_days, spent_allowance, locked_allowance, tax,
 potential_revenue, earned_revenue, locked_collateral, risked_collateral, burnt_collateral, date_created
 FROM metrics WHERE date_created BETWEEN $1 AND $2 ORDER BY date_created;`, sqlTime(start), sqlTime(end))
 		if err != nil {
@@ -491,11 +606,30 @@ func (s *Store) RentersCount(ctx context.Context, start, end time.Time) (n int64
 	return
 }
 
+// NewHosts returns the count of distinct hosts whose first recorded event
+// (first_seen) falls in [start, end]. first_seen is constant per host across
+// snapshots, so DISTINCT on host_key collapses the per-snapshot rows.
+func (s *Store) NewHosts(ctx context.Context, start, end time.Time) (n int64, err error) {
+	err = s.transaction(ctx, func(ctx context.Context, tx *txn) error {
+		return tx.QueryRow(ctx, `SELECT COUNT(DISTINCT host_key) FROM host_metrics WHERE first_seen BETWEEN $1 AND $2 AND first_seen > 0;`, sqlTime(start), sqlTime(end)).Scan(&n)
+	})
+	return
+}
+
+// NewRenters returns the count of distinct renters whose first recorded event
+// (first_seen) falls in [start, end].
+func (s *Store) NewRenters(ctx context.Context, start, end time.Time) (n int64, err error) {
+	err = s.transaction(ctx, func(ctx context.Context, tx *txn) error {
+		return tx.QueryRow(ctx, `SELECT COUNT(DISTINCT renter_key) FROM renter_metrics WHERE first_seen BETWEEN $1 AND $2 AND first_seen > 0;`, sqlTime(start), sqlTime(end)).Scan(&n)
+	})
+	return
+}
+
 // TopHosts retrieves the top hosts based on earned revenue within a specified time range.
 // The results are limited to the specified number of hosts.
 func (s *Store) TopHosts(ctx context.Context, start, end time.Time, limit int) (ms []metrics.Host, err error) {
 	err = s.transaction(ctx, func(ctx context.Context, tx *txn) error {
-		rows, err := tx.Query(ctx, `SELECT host_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, active_size, total_size, burnt_collateral, locked_collateral, risked_collateral, potential_revenue, earned_revenue, date_created
+		rows, err := tx.Query(ctx, `SELECT host_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, revision_count, active_size, total_size, bytes_uploaded, burnt_collateral, locked_collateral, risked_collateral, potential_revenue, earned_revenue, first_seen, last_active, date_created
 FROM host_metrics WHERE date_created BETWEEN $1 AND $2 GROUP BY host_key ORDER BY earned_revenue DESC LIMIT $3;`,
 			sqlTime(start), sqlTime(end), limit)
 		if err != nil {
@@ -519,7 +653,7 @@ FROM host_metrics WHERE date_created BETWEEN $1 AND $2 GROUP BY host_key ORDER B
 // The results are limited to the specified number of renters.
 func (s *Store) TopRenters(ctx context.Context, start, end time.Time, limit int) (ms []metrics.Renter, err error) {
 	err = s.transaction(ctx, func(ctx context.Context, tx *txn) error {
-		rows, err := tx.Query(ctx, `SELECT renter_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, active_size, total_size, locked_allowance, max(spent_allowance), date_created
+		rows, err := tx.Query(ctx, `SELECT renter_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, revision_count, active_size, total_size, bytes_uploaded, locked_allowance, max(spent_allowance), tax, first_seen, last_active, date_created
 FROM renter_metrics WHERE date_created BETWEEN $1 AND $2 GROUP BY renter_key ORDER BY spent_allowance DESC LIMIT $3;`,
 			sqlTime(start), sqlTime(end), limit)
 		if err != nil {
@@ -540,8 +674,8 @@ FROM renter_metrics WHERE date_created BETWEEN $1 AND $2 GROUP BY renter_key ORD
 }
 
 func getRenterMetrics(ctx context.Context, tx *txn, renterKey types.PublicKey, timestamp time.Time) (metrics.Renter, error) {
-	row := tx.QueryRow(ctx, `SELECT renter_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, 
-	active_size, total_size, locked_allowance, spent_allowance, date_created 
+	row := tx.QueryRow(ctx, `SELECT renter_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, revision_count,
+	active_size, total_size, bytes_uploaded, locked_allowance, spent_allowance, tax, first_seen, last_active, date_created
 FROM renter_metrics WHERE renter_key=$1 AND date_created <= $2
 ORDER BY date_created DESC LIMIT 1;`, sqlHash256(renterKey), sqlTime(timestamp))
 	m, err := scanRenter(row)
@@ -551,8 +685,8 @@ ORDER BY date_created DESC LIMIT 1;`, sqlHash256(renterKey), sqlTime(timestamp))
 }
 
 func getHostMetrics(ctx context.Context, tx *txn, hostKey types.PublicKey, timestamp time.Time) (metrics.Host, error) {
-	row := tx.QueryRow(ctx, `SELECT host_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, 
-	active_size, total_size, burnt_collateral, locked_collateral, risked_collateral, potential_revenue, earned_revenue, date_created 
+	row := tx.QueryRow(ctx, `SELECT host_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, revision_count,
+	active_size, total_size, bytes_uploaded, burnt_collateral, locked_collateral, risked_collateral, potential_revenue, earned_revenue, first_seen, last_active, date_created
 FROM host_metrics WHERE host_key=$1 AND date_created <= $2
 ORDER BY date_created DESC LIMIT 1;`, sqlHash256(hostKey), sqlTime(timestamp))
 	m, err := scanHost(row)
@@ -562,8 +696,8 @@ ORDER BY date_created DESC LIMIT 1;`, sqlHash256(hostKey), sqlTime(timestamp))
 }
 
 func getMetrics(ctx context.Context, tx *txn, timestamp time.Time) (metrics.Metrics, error) {
-	row := tx.QueryRow(ctx, `SELECT renters, hosts, active_contracts, renewed_contracts, successful_contracts, failed_contracts, 
-active_size, total_size, spent_allowance, locked_allowance, potential_revenue, earned_revenue, locked_collateral, 
+	row := tx.QueryRow(ctx, `SELECT renters, hosts, active_contracts, renewed_contracts, successful_contracts, failed_contracts, v2_transaction_count, revision_count,
+active_size, total_size, bytes_uploaded, active_byte_days, spent_allowance, locked_allowance, tax, potential_revenue, earned_revenue, locked_collateral,
 risked_collateral, burnt_collateral, date_created
 FROM metrics WHERE date_created <= $1
 ORDER BY date_created DESC LIMIT 1;`, sqlTime(timestamp))
@@ -573,55 +707,69 @@ ORDER BY date_created DESC LIMIT 1;`, sqlTime(timestamp))
 }
 
 func insertHostMetrics(ctx context.Context, tx *txn, m metrics.Host) error {
-	_, err := tx.Exec(ctx, `INSERT OR REPLACE INTO host_metrics (host_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, active_size, total_size, burnt_collateral, locked_collateral, risked_collateral, potential_revenue, earned_revenue, date_created)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13);`,
+	_, err := tx.Exec(ctx, `INSERT OR REPLACE INTO host_metrics (host_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, revision_count, active_size, total_size, bytes_uploaded, burnt_collateral, locked_collateral, risked_collateral, potential_revenue, earned_revenue, first_seen, last_active, date_created)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17);`,
 		sqlHash256(m.PublicKey),
 		m.ActiveContracts,
 		m.RenewedContracts,
 		m.SuccessfulContracts,
 		m.FailedContracts,
+		m.RevisionCount,
 		m.ActiveSize,
 		m.TotalSize,
+		m.BytesUploaded,
 		sqlCurrency(m.BurntCollateral),
 		sqlCurrency(m.LockedCollateral),
 		sqlCurrency(m.RiskedCollateral),
 		sqlCurrency(m.PotentialRevenue),
 		sqlCurrency(m.EarnedRevenue),
+		sqlTime(m.FirstSeen),
+		sqlTime(m.LastActive),
 		sqlTime(m.Timestamp))
 	return err
 }
 
 func insertRenterMetrics(ctx context.Context, tx *txn, m metrics.Renter) error {
-	_, err := tx.Exec(ctx, `INSERT OR REPLACE INTO renter_metrics (renter_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, active_size, total_size, locked_allowance, spent_allowance, date_created)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10);`,
+	_, err := tx.Exec(ctx, `INSERT OR REPLACE INTO renter_metrics (renter_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, revision_count, active_size, total_size, bytes_uploaded, locked_allowance, spent_allowance, tax, first_seen, last_active, date_created)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15);`,
 		sqlHash256(m.PublicKey),
 		m.ActiveContracts,
 		m.RenewedContracts,
 		m.SuccessfulContracts,
 		m.FailedContracts,
+		m.RevisionCount,
 		m.ActiveSize,
 		m.TotalSize,
+		m.BytesUploaded,
 		sqlCurrency(m.Locked),
 		sqlCurrency(m.Spent),
+		sqlCurrency(m.Tax),
+		sqlTime(m.FirstSeen),
+		sqlTime(m.LastActive),
 		sqlTime(m.Timestamp))
 	return err
 }
 
 func insertMetrics(ctx context.Context, tx *txn, m metrics.Metrics) error {
-	_, err := tx.Exec(ctx, `INSERT OR REPLACE INTO metrics (renters, hosts, active_contracts, 
-renewed_contracts, successful_contracts, failed_contracts, active_size, total_size, spent_allowance, locked_allowance,
+	_, err := tx.Exec(ctx, `INSERT OR REPLACE INTO metrics (renters, hosts, active_contracts,
+renewed_contracts, successful_contracts, failed_contracts, v2_transaction_count, revision_count, active_size, total_size, bytes_uploaded, active_byte_days, spent_allowance, locked_allowance, tax,
 potential_revenue, earned_revenue, locked_collateral, risked_collateral, burnt_collateral, date_created)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16);`,
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21);`,
 		m.Renters,
 		m.Hosts,
 		m.ActiveContracts,
 		m.RenewedContracts,
 		m.SuccessfulContracts,
 		m.FailedContracts,
+		m.TransactionCount,
+		m.RevisionCount,
 		m.ActiveSize,
 		m.TotalSize,
+		m.BytesUploaded,
+		m.ActiveByteDays,
 		sqlCurrency(m.SpentAllowance),
 		sqlCurrency(m.LockedAllowance),
+		sqlCurrency(m.Tax),
 		sqlCurrency(m.PotentialRevenue),
 		sqlCurrency(m.EarnedRevenue),
 		sqlCurrency(m.LockedCollateral),
@@ -639,10 +787,15 @@ func scanMetrics(s scanner) (m metrics.Metrics, err error) {
 		&m.RenewedContracts,
 		&m.SuccessfulContracts,
 		&m.FailedContracts,
+		&m.TransactionCount,
+		&m.RevisionCount,
 		&m.ActiveSize,
 		&m.TotalSize,
+		&m.BytesUploaded,
+		&m.ActiveByteDays,
 		(*sqlCurrency)(&m.SpentAllowance),
 		(*sqlCurrency)(&m.LockedAllowance),
+		(*sqlCurrency)(&m.Tax),
 		(*sqlCurrency)(&m.PotentialRevenue),
 		(*sqlCurrency)(&m.EarnedRevenue),
 		(*sqlCurrency)(&m.LockedCollateral),
@@ -660,10 +813,15 @@ func scanRenter(s scanner) (r metrics.Renter, err error) {
 		&r.RenewedContracts,
 		&r.SuccessfulContracts,
 		&r.FailedContracts,
+		&r.RevisionCount,
 		&r.ActiveSize,
 		&r.TotalSize,
+		&r.BytesUploaded,
 		(*sqlCurrency)(&r.Locked),
 		(*sqlCurrency)(&r.Spent),
+		(*sqlCurrency)(&r.Tax),
+		(*sqlTime)(&r.FirstSeen),
+		(*sqlTime)(&r.LastActive),
 		(*sqlTime)(&r.Timestamp),
 	)
 	return
@@ -676,13 +834,17 @@ func scanHost(s scanner) (h metrics.Host, err error) {
 		&h.RenewedContracts,
 		&h.SuccessfulContracts,
 		&h.FailedContracts,
+		&h.RevisionCount,
 		&h.ActiveSize,
 		&h.TotalSize,
+		&h.BytesUploaded,
 		(*sqlCurrency)(&h.BurntCollateral),
 		(*sqlCurrency)(&h.LockedCollateral),
 		(*sqlCurrency)(&h.RiskedCollateral),
 		(*sqlCurrency)(&h.PotentialRevenue),
 		(*sqlCurrency)(&h.EarnedRevenue),
+		(*sqlTime)(&h.FirstSeen),
+		(*sqlTime)(&h.LastActive),
 		(*sqlTime)(&h.Timestamp),
 	)
 	return

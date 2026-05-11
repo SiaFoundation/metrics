@@ -20,6 +20,8 @@ const (
 	ResolutionTypeRenewed
 )
 
+const blockPruneDays = 7
+
 type (
 	// A ContractResolutionType represents the type of contract resolution.
 	ContractResolutionType uint8
@@ -31,16 +33,34 @@ type (
 		RenewedContracts    uint64          `json:"renewedContracts"`
 		SuccessfulContracts uint64          `json:"successfulContracts"`
 		FailedContracts     uint64          `json:"failedContracts"`
+		// RevisionCount is the cumulative number of v2 contract revision
+		// events for this host across all indexed blocks. One block can
+		// contain at most one revision per contract.
+		RevisionCount uint64 `json:"revisionCount"`
 
 		ActiveSize uint64 `json:"activeSize"`
 		TotalSize  uint64 `json:"totalSize"`
+		// BytesUploaded is the cumulative, monotonically-increasing total
+		// of bytes added to this host's contracts. Unlike TotalSize (which
+		// tracks chain-state size and decreases when contracts shrink),
+		// BytesUploaded only ever increases — on each formation by the
+		// contract's initial Size, and on each revision by max(0, NewSize - ExistingSize).
+		BytesUploaded uint64 `json:"bytesUploaded"`
 
 		LockedCollateral types.Currency `json:"lockedCollateral"`
 		RiskedCollateral types.Currency `json:"riskedCollateral"`
 		BurntCollateral  types.Currency `json:"burntCollateral"`
 		PotentialRevenue types.Currency `json:"potentialRevenue"`
 		EarnedRevenue    types.Currency `json:"earnedRevenue"`
-		Timestamp        time.Time      `json:"timestamp"`
+
+		// FirstSeen is the truncated-hour timestamp of the first block in
+		// which this host had any v2 contract event (formation, revision,
+		// or resolution). Used to derive "new hosts in period" metrics.
+		FirstSeen time.Time `json:"firstSeen"`
+		// LastActive is the truncated-hour timestamp of the most recent
+		// block in which this host had any v2 contract event.
+		LastActive time.Time `json:"lastActive"`
+		Timestamp  time.Time `json:"timestamp"`
 	}
 
 	// A Renter represents the metrics for a renter.
@@ -51,13 +71,35 @@ type (
 		RenewedContracts    uint64 `json:"renewedContracts"`
 		SuccessfulContracts uint64 `json:"successfulContracts"`
 		FailedContracts     uint64 `json:"failedContracts"`
+		// RevisionCount is the cumulative number of v2 contract revision
+		// events for this renter across all indexed blocks.
+		RevisionCount uint64 `json:"revisionCount"`
 
 		ActiveSize uint64 `json:"activeSize"`
 		TotalSize  uint64 `json:"totalSize"`
+		// BytesUploaded is the cumulative, monotonically-increasing total
+		// of bytes this renter has added to their contracts. See Host.BytesUploaded
+		// for the same semantics applied to the host side.
+		BytesUploaded uint64 `json:"bytesUploaded"`
 
-		Spent     types.Currency `json:"spent"`
-		Locked    types.Currency `json:"locked"`
-		Timestamp time.Time      `json:"timestamp"`
+		// Spent is the cumulative SC the renter has paid to hosts via
+		// contracts — the upfront contract price at each formation plus
+		// the allowance consumed by storage revisions. It does not
+		// include Tax or miner fees.
+		Spent  types.Currency `json:"spent"`
+		Locked types.Currency `json:"locked"`
+		// Tax is the cumulative siafund tax the renter has paid on contract
+		// formations and renewals.
+		Tax types.Currency `json:"tax"`
+
+		// FirstSeen is the truncated-hour timestamp of the first block in
+		// which this renter had any v2 contract event. Used to derive
+		// "new renters in period" metrics.
+		FirstSeen time.Time `json:"firstSeen"`
+		// LastActive is the truncated-hour timestamp of the most recent
+		// block in which this renter had any v2 contract event.
+		LastActive time.Time `json:"lastActive"`
+		Timestamp  time.Time `json:"timestamp"`
 	}
 
 	// Metrics represents the global metrics.
@@ -69,12 +111,35 @@ type (
 		RenewedContracts    uint64 `json:"renewedContracts"`
 		SuccessfulContracts uint64 `json:"successfulContracts"`
 		FailedContracts     uint64 `json:"failedContracts"`
+		// TransactionCount is the cumulative number of v2 transactions
+		// in all indexed blocks. Daily on-chain activity can be derived
+		// by diffing two snapshots a day apart.
+		TransactionCount uint64 `json:"transactionCount"`
+		// RevisionCount is the cumulative number of v2 contract revision
+		// events across all indexed blocks. One block can contain at
+		// most one revision per contract.
+		RevisionCount uint64 `json:"revisionCount"`
 
 		ActiveSize uint64 `json:"activeSize"`
 		TotalSize  uint64 `json:"totalSize"`
+		// BytesUploaded is the cumulative, monotonically-increasing total
+		// of bytes ever added to the network across all contracts. Unlike
+		// TotalSize (which decreases on shrink revisions), this only ever
+		// grows — on each formation by Size, and on each revision by
+		// max(0, NewSize - ExistingSize).
+		BytesUploaded uint64 `json:"bytesUploaded"`
+		// ActiveByteDays is the cumulative byte-days of storage held by
+		// the network — for each indexed block, ActiveSize * block_interval
+		// (in days) is added. This captures the protocol's "work done" unit
+		// (the host's per-byte storage payout).
+		ActiveByteDays uint64 `json:"activeByteDays"`
 
 		SpentAllowance  types.Currency `json:"spentAllowance"`
 		LockedAllowance types.Currency `json:"lockedAllowance"`
+		// Tax is the cumulative siafund tax paid across all v2 contract
+		// formations and renewals. Tax is paid to siafund holders and is
+		// not part of SpentAllowance (which only counts SC flowing to hosts).
+		Tax types.Currency `json:"tax"`
 
 		PotentialRevenue types.Currency `json:"potentialRevenue"`
 		EarnedRevenue    types.Currency `json:"earnedRevenue"`
@@ -91,7 +156,20 @@ type (
 		Renter types.PublicKey
 		Size   uint64
 
-		RenterAllowance      types.Currency
+		// RenterAllowance is the refundable allowance locked into the
+		// contract at formation (= RenterOutput.Value).
+		RenterAllowance types.Currency
+		// RenterContractPrice is the SC the renter has irrevocably paid
+		// to the host at formation (= HostOutput.Value - TotalCollateral).
+		// For fresh formations this is just the contract price; for
+		// contracts created by a renewal it also includes any pre-paid
+		// storage cost rolled into HostOutput.Value.
+		RenterContractPrice types.Currency
+		// RenterTax is the siafund tax levied on this contract at
+		// formation. It is paid by the renter to siafund holders and is
+		// not refundable.
+		RenterTax types.Currency
+
 		HostLockedCollateral types.Currency
 		HostRiskedCollateral types.Currency
 		HostPotentialRevenue types.Currency
@@ -122,8 +200,11 @@ type (
 		Size   uint64
 		Type   ContractResolutionType
 
+		// RenterAllowance is the refundable allowance still locked in
+		// the contract at the time of resolution (= RenterOutput.Value).
+		// On any resolution path it stops being locked; on a renewal
+		// the RenterRollover portion is re-locked into the new contract.
 		RenterAllowance types.Currency
-		RenterSpent     types.Currency
 
 		HostLockedCollateral types.Currency
 		HostRiskedCollateral types.Currency
@@ -136,6 +217,15 @@ type (
 	State struct {
 		Timestamp time.Time `json:"timestamp"`
 
+		// V2TransactionCount is the total number of v2 transactions in
+		// the block this state was parsed from. It is added to the
+		// global TransactionCount on apply (subtracted on revert).
+		V2TransactionCount uint64 `json:"v2TransactionCount"`
+		// BlockInterval is the network's consensus block interval at the
+		// block this state was parsed from. Used to compute byte-days
+		// contributions for ActiveByteDays.
+		BlockInterval time.Duration `json:"blockInterval"`
+
 		Formations  []ContractFormation  `json:"formations"`
 		Revisions   []ContractRevision   `json:"revisions"`
 		Resolutions []ContractResolution `json:"validResolutions"`
@@ -147,6 +237,7 @@ type (
 		UpdatesSince(index types.ChainIndex, limit int) ([]chain.RevertUpdate, []chain.ApplyUpdate, error)
 		BestIndex(uint64) (types.ChainIndex, bool)
 		OnReorg(func(types.ChainIndex)) func()
+		PruneBlocks(height uint64)
 	}
 
 	// A Store provides access to the persistent store for metrics.
@@ -168,6 +259,13 @@ type (
 
 		HostsCount(ctx context.Context, start, end time.Time) (int64, error)
 		RentersCount(ctx context.Context, start, end time.Time) (int64, error)
+
+		// NewHosts returns the count of distinct host keys whose first
+		// recorded event (FirstSeen) falls in [start, end].
+		NewHosts(ctx context.Context, start, end time.Time) (int64, error)
+		// NewRenters returns the count of distinct renter keys whose
+		// first recorded event (FirstSeen) falls in [start, end].
+		NewRenters(ctx context.Context, start, end time.Time) (int64, error)
 	}
 
 	// A Manager provides access to the metrics and manages the indexing of the chain state.
@@ -186,26 +284,59 @@ var (
 	ErrNotFound = fmt.Errorf("not found")
 )
 
-func parseDiffs(timestamp time.Time, diffs []consensus.V2FileContractElementDiff, log *zap.Logger) (State, error) {
+// wellFormedV2Contract reports whether a v2 file contract fits the standard
+// payout decomposition assumed by the metrics (MissedHostValue ≤ TotalCollateral
+// ≤ HostOutput.Value). Consensus only enforces the second inequality, so a
+// hand-crafted or non-standard contract can legitimately violate the first —
+// in which case fc.RiskedCollateral() underflows. We treat such contracts as
+// malformed and skip them for metric purposes.
+func wellFormedV2Contract(fc types.V2FileContract) bool {
+	return fc.MissedHostValue.Cmp(fc.TotalCollateral) <= 0
+}
+
+func parseDiffs(timestamp time.Time, cs consensus.State, diffs []consensus.V2FileContractElementDiff, log *zap.Logger) (State, error) {
 	state := State{
 		Timestamp: timestamp.Truncate(time.Hour),
 	}
 	for _, diff := range diffs {
 		log := log.With(zap.Stringer("id", diff.V2FileContractElement.ID))
 		fc := diff.V2FileContractElement.V2FileContract
+		// Skip contracts that don't fit the standard payout decomposition.
+		// Consensus allows MissedHostValue > TotalCollateral, but the metric
+		// model can't attribute such a contract's payouts to collateral vs.
+		// revenue, and fc.RiskedCollateral() would underflow. Since consensus
+		// makes TotalCollateral immutable and only allows MissedHostValue to
+		// decrease, a well-formed parent implies a well-formed revision, so
+		// checking the parent here covers formations, revisions, and
+		// resolutions consistently.
+		if !wellFormedV2Contract(fc) {
+			log.Warn("skipping malformed v2 contract", zap.Stringer("missedHostValue", fc.MissedHostValue), zap.Stringer("totalCollateral", fc.TotalCollateral), zap.Stringer("hostOutput", fc.HostOutput.Value))
+			continue
+		}
 		if diff.Created {
+			// RenterContractPrice is the SC the renter has already paid the
+			// host at formation. At a fresh formation this equals the contract
+			// price; at a renewal it also includes any pre-paid storage cost
+			// that was rolled into HostOutput.Value. Since MissedHostValue ==
+			// TotalCollateral at standard formations, this equals
+			// fc.RiskedHostRevenue() but is computed explicitly to be robust
+			// to non-standard contracts where they differ.
+			renterContractPrice := fc.HostOutput.Value.Sub(fc.TotalCollateral)
+			renterTax := cs.V2FileContractTax(fc)
 			state.Formations = append(state.Formations, ContractFormation{
 				Host:   fc.HostPublicKey,
 				Renter: fc.RenterPublicKey,
 				Size:   fc.Filesize,
 
-				RenterAllowance: fc.RemainingAllowance(),
+				RenterAllowance:     fc.RemainingAllowance(),
+				RenterContractPrice: renterContractPrice,
+				RenterTax:           renterTax,
 
 				HostLockedCollateral: fc.TotalCollateral,
 				HostRiskedCollateral: fc.RiskedCollateral(),
 				HostPotentialRevenue: fc.RiskedHostRevenue(),
 			})
-			log.Debug("contract formation", zap.Stringer("host", fc.HostPublicKey), zap.Stringer("renter", fc.RenterPublicKey), zap.Stringer("allowance", fc.RemainingAllowance()), zap.Stringer("collateral", fc.RiskedCollateral()), zap.Stringer("revenue", fc.RiskedHostRevenue()))
+			log.Debug("contract formation", zap.Stringer("host", fc.HostPublicKey), zap.Stringer("renter", fc.RenterPublicKey), zap.Stringer("allowance", fc.RemainingAllowance()), zap.Stringer("contractPrice", renterContractPrice), zap.Stringer("tax", renterTax), zap.Stringer("collateral", fc.RiskedCollateral()), zap.Stringer("revenue", fc.RiskedHostRevenue()))
 		} else if rev, ok := diff.V2RevisionElement(); ok {
 			state.Revisions = append(state.Revisions, ContractRevision{
 				Host:   fc.HostPublicKey,
@@ -250,11 +381,11 @@ func parseDiffs(timestamp time.Time, diffs []consensus.V2FileContractElementDiff
 				if res.FinalHostOutput.Value.Cmp(fc.TotalCollateral) > 0 {
 					cr.HostEarnedRevenue = res.FinalHostOutput.Value.Sub(fc.TotalCollateral)
 				}
-
-				remainingAllowance := res.FinalRenterOutput.Value.Add(res.RenterRollover)
-				if remainingAllowance.Cmp(fc.RemainingAllowance()) < 0 {
-					cr.RenterSpent = fc.RemainingAllowance().Sub(remainingAllowance)
-				}
+				// The renter-side spend telescopes naturally: the rolled-over
+				// allowance is removed from this contract's Locked here and
+				// re-added by the new contract's formation entry, and the new
+				// contract's formation also records its own RenterContractPrice.
+				// We don't need a per-resolution renter-spend adjustment.
 			default:
 				panic(fmt.Sprintf("unknown resolution type: %T", res)) // should never happen
 			}
@@ -279,33 +410,48 @@ func (m *Manager) indexState(ctx context.Context, tip types.ChainIndex) (types.C
 			return tip, nil
 		}
 
+		var cs consensus.State
 		for _, cru := range reverted {
 			revertIndex := types.ChainIndex{
 				Height: cru.State.Index.Height + 1,
 				ID:     cru.Block.ID(),
 			}
 			log := m.log.With(zap.Stringer("index", revertIndex)).Named("revert")
-			state, err := parseDiffs(cru.Block.Timestamp.Truncate(time.Hour), cru.V2FileContractElementDiffs(), log)
+			state, err := parseDiffs(cru.Block.Timestamp.Truncate(time.Hour), cru.State, cru.V2FileContractElementDiffs(), log)
 			if err != nil {
 				return types.ChainIndex{}, fmt.Errorf("failed to parse reverted diffs: %w", err)
-			} else if err := m.store.RevertState(ctx, cru.State.Index, state); err != nil {
+			}
+			state.V2TransactionCount = uint64(len(cru.Block.V2Transactions()))
+			state.BlockInterval = cru.State.Network.BlockInterval
+			if err := m.store.RevertState(ctx, cru.State.Index, state); err != nil {
 				return types.ChainIndex{}, fmt.Errorf("failed to revert state: %w", err)
 			}
 			tip = cru.State.Index
+			cs = cru.State
 			log.Debug("reverted state")
 		}
 
 		for _, cau := range applied {
 			timestamp := cau.Block.Timestamp.Truncate(time.Hour)
 			log := m.log.With(zap.Stringer("index", cau.State.Index), zap.Time("timestamp", timestamp)).Named("apply")
-			state, err := parseDiffs(timestamp, cau.V2FileContractElementDiffs(), log)
+			state, err := parseDiffs(timestamp, cau.State, cau.V2FileContractElementDiffs(), log)
 			if err != nil {
 				return types.ChainIndex{}, fmt.Errorf("failed to parse applied diffs: %w", err)
-			} else if err := m.store.ApplyState(ctx, cau.State.Index, state); err != nil {
+			}
+			state.V2TransactionCount = uint64(len(cau.Block.V2Transactions()))
+			state.BlockInterval = cau.State.Network.BlockInterval
+			if err := m.store.ApplyState(ctx, cau.State.Index, state); err != nil {
 				return types.ChainIndex{}, fmt.Errorf("failed to apply state: %w", err)
 			}
 			tip = cau.State.Index
+			cs = cau.State
 			log.Debug("applied state")
+		}
+
+		blocksPerDay := uint64((24 * time.Hour) / cs.Network.BlockInterval)
+		pruneTarget := blocksPerDay * blockPruneDays
+		if tip.Height > pruneTarget {
+			m.chain.PruneBlocks(tip.Height - pruneTarget)
 		}
 	}
 }
@@ -358,6 +504,18 @@ func (m *Manager) HostsCount(ctx context.Context, start, end time.Time) (int64, 
 // RentersCount retrieves the count of renters over a time range.
 func (m *Manager) RentersCount(ctx context.Context, start, end time.Time) (int64, error) {
 	return m.store.RentersCount(ctx, start, end)
+}
+
+// NewHosts retrieves the count of hosts whose first recorded event falls in
+// the given time range. Use day boundaries for "new hosts per day".
+func (m *Manager) NewHosts(ctx context.Context, start, end time.Time) (int64, error) {
+	return m.store.NewHosts(ctx, start, end)
+}
+
+// NewRenters retrieves the count of renters whose first recorded event falls
+// in the given time range. Use day boundaries for "new renters per day".
+func (m *Manager) NewRenters(ctx context.Context, start, end time.Time) (int64, error) {
+	return m.store.NewRenters(ctx, start, end)
 }
 
 // Close stops the manager and cleans up resources.
