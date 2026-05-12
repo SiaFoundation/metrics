@@ -184,6 +184,7 @@ func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state met
 			rm.ActiveContracts++
 			rm.ActiveSize += resolution.Size
 			rm.Locked = rm.Locked.Add(resolution.RenterAllowance)
+			rm.Spent = rm.Spent.Add(resolution.RolledRevenue)
 
 			gm, err := getMetrics(ctx, tx, state.Timestamp)
 			if err != nil {
@@ -191,6 +192,7 @@ func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state met
 			}
 			gm.ActiveContracts++
 			gm.LockedAllowance = gm.LockedAllowance.Add(resolution.RenterAllowance)
+			gm.SpentAllowance = gm.SpentAllowance.Add(resolution.RolledRevenue)
 			gm.EarnedRevenue = gm.EarnedRevenue.Sub(resolution.HostEarnedRevenue)
 			gm.BurntCollateral = gm.BurntCollateral.Sub(resolution.HostBurn)
 			gm.PotentialRevenue = gm.PotentialRevenue.Add(resolution.HostPotentialRevenue)
@@ -396,6 +398,9 @@ func (s *Store) ApplyState(ctx context.Context, tip types.ChainIndex, state metr
 			rm.ActiveContracts--
 			rm.ActiveSize -= resolution.Size
 			rm.Locked = rm.Locked.Sub(resolution.RenterAllowance)
+			// Cancel the rolled-revenue portion of the successor's
+			// RenterContractPrice. See ContractResolution.RolledRevenue.
+			rm.Spent = rm.Spent.Sub(resolution.RolledRevenue)
 			if rm.FirstSeen.IsZero() {
 				rm.FirstSeen = state.Timestamp
 			}
@@ -408,6 +413,7 @@ func (s *Store) ApplyState(ctx context.Context, tip types.ChainIndex, state metr
 			}
 			gm.ActiveContracts--
 			gm.LockedAllowance = gm.LockedAllowance.Sub(resolution.RenterAllowance)
+			gm.SpentAllowance = gm.SpentAllowance.Sub(resolution.RolledRevenue)
 			gm.EarnedRevenue = gm.EarnedRevenue.Add(resolution.HostEarnedRevenue)
 			gm.BurntCollateral = gm.BurntCollateral.Add(resolution.HostBurn)
 			gm.PotentialRevenue = gm.PotentialRevenue.Sub(resolution.HostPotentialRevenue)

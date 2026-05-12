@@ -213,6 +213,18 @@ type (
 		// On any resolution path it stops being locked; on a renewal
 		// the RenterRollover portion is re-locked into the new contract.
 		RenterAllowance types.Currency
+		// RolledRevenue is the portion of HostRollover that represents
+		// previously-accrued revenue rather than original collateral, i.e.
+		// max(0, HostRollover − TotalCollateral). It is zero for standard
+		// renewals (where HostRollover ≤ TotalCollateral) and equal to
+		// fc.RiskedHostRevenue() for refreshes (where HostRollover absorbs
+		// the entire HostOutput.Value). The renewed contract counts this
+		// quantity inside its own RiskedHostRevenue and RenterContractPrice
+		// at formation; subtracting it here cancels the double-count so
+		// that the rolled revenue stays "at risk" rather than being
+		// realized at renewal time — if the new contract eventually fails,
+		// the rolled revenue is correctly absorbed into HostBurn.
+		RolledRevenue types.Currency
 
 		HostLockedCollateral types.Currency
 		HostRiskedCollateral types.Currency
@@ -435,24 +447,46 @@ func parseDiffs(timestamp time.Time, cs consensus.State, diffs []consensus.V2Fil
 					break
 				}
 				cr.Type = ResolutionTypeRenewed
-				// The host's accrued revenue over the old contract's
-				// life is HostOutput.Value − TotalCollateral, the same
-				// quantity earned on a storage proof. Whether that
-				// revenue is paid out at renewal as FinalHostOutput or
-				// carried into the new contract as part of HostRollover
-				// is irrelevant to the old contract's books: it's still
-				// earnings attributable to this contract. In the typical
-				// RHP4 renewal/refresh, HostRollover absorbs the locked
-				// collateral and FinalHostOutput equals exactly this
-				// quantity; on a full-rollover refresh FinalHostOutput
-				// is zero. wellFormedV2Contract guarantees the subtraction
-				// is safe.
-				cr.HostEarnedRevenue = fc.RiskedHostRevenue()
-				// The renter-side spend telescopes naturally: the rolled-over
-				// allowance is removed from this contract's Locked here and
-				// re-added by the new contract's formation entry, and the new
-				// contract's formation also records its own RenterContractPrice.
-				// We don't need a per-resolution renter-spend adjustment.
+				// HostRollover is taken from fc.HostOutput.Value, which
+				// decomposes as TotalCollateral + RiskedHostRevenue.
+				// Treat HostRollover as absorbing collateral first; any
+				// excess is previously-accrued revenue being carried into
+				// the new contract. For a standard RHP4 renew this is
+				// zero (HostRollover ≤ TotalCollateral); for an RHP4
+				// refresh HostRollover absorbs the entire HostOutput and
+				// this equals fc.RiskedHostRevenue().
+				if res.HostRollover.Cmp(fc.TotalCollateral) > 0 {
+					cr.RolledRevenue = res.HostRollover.Sub(fc.TotalCollateral)
+				}
+				// HostEarnedRevenue is what is irrevocably realized to
+				// the host at this resolution: the wallet inflow
+				// (FinalHostOutput.Value) beyond any of the host's
+				// original collateral that's returned to wallet
+				// (TotalCollateral − HostRollover, when positive). In a
+				// standard renew the rolled-over collateral is fully
+				// absorbed, the wallet receives exactly
+				// fc.RiskedHostRevenue(), and that becomes the earned
+				// revenue. In a refresh the entire RiskedHostRevenue is
+				// rolled into the new contract, FinalHostOutput is zero,
+				// and earned revenue at this point is zero — the rolled
+				// revenue stays at risk and will be recognized later
+				// (as EarnedRevenue on a successful proof / renew of
+				// the successor, or absorbed into HostBurn if the
+				// successor expires with burn).
+				var collateralReturned types.Currency
+				if fc.TotalCollateral.Cmp(res.HostRollover) > 0 {
+					collateralReturned = fc.TotalCollateral.Sub(res.HostRollover)
+				}
+				if res.FinalHostOutput.Value.Cmp(collateralReturned) > 0 {
+					cr.HostEarnedRevenue = res.FinalHostOutput.Value.Sub(collateralReturned)
+				}
+				// Renter-side telescoping. The rolled-over allowance is
+				// removed from Locked here and re-added by the new
+				// contract's formation. The new contract's
+				// RenterContractPrice (NewHostOutput − NewTotalCollateral)
+				// includes RolledRevenue, so without correction Spent
+				// would double-count it on every refresh; the sqlite
+				// layer subtracts RolledRevenue here to cancel that.
 			default:
 				panic(fmt.Sprintf("unknown resolution type: %T", res)) // should never happen
 			}
