@@ -62,18 +62,28 @@ func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state met
 		}
 
 		for _, formation := range state.Formations {
+			// Mirror the Apply-side guard: renewal-created formations did
+			// not contribute to BytesUploaded, so we don't subtract on
+			// revert either.
+			var uploaded uint64
+			if !formation.FromRenewal {
+				uploaded = formation.Size
+			}
+
 			gm, err := getMetrics(ctx, tx, state.Timestamp)
 			if err != nil {
 				return fmt.Errorf("failed to get global metrics: %w", err)
 			}
 			gm.ActiveContracts--
+			gm.ActiveSize -= formation.Size
+			gm.TotalSize -= formation.Size
 			gm.LockedAllowance = gm.LockedAllowance.Sub(formation.RenterAllowance)
 			gm.SpentAllowance = gm.SpentAllowance.Sub(formation.RenterContractPrice)
 			gm.Tax = gm.Tax.Sub(formation.RenterTax)
 			gm.PotentialRevenue = gm.PotentialRevenue.Sub(formation.HostPotentialRevenue)
 			gm.LockedCollateral = gm.LockedCollateral.Sub(formation.HostLockedCollateral)
 			gm.RiskedCollateral = gm.RiskedCollateral.Sub(formation.HostRiskedCollateral)
-			gm.BytesUploaded -= formation.Size
+			gm.BytesUploaded -= uploaded
 
 			hm, err := getHostMetrics(ctx, tx, formation.Host, state.Timestamp)
 			if err != nil {
@@ -82,7 +92,7 @@ func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state met
 			hm.ActiveContracts--
 			hm.ActiveSize -= formation.Size
 			hm.TotalSize -= formation.Size
-			hm.BytesUploaded -= formation.Size
+			hm.BytesUploaded -= uploaded
 			hm.LockedCollateral = hm.LockedCollateral.Sub(formation.HostLockedCollateral)
 			hm.RiskedCollateral = hm.RiskedCollateral.Sub(formation.HostRiskedCollateral)
 			hm.PotentialRevenue = hm.PotentialRevenue.Sub(formation.HostPotentialRevenue)
@@ -94,7 +104,7 @@ func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state met
 			rm.ActiveContracts--
 			rm.ActiveSize -= formation.Size
 			rm.TotalSize -= formation.Size
-			rm.BytesUploaded -= formation.Size
+			rm.BytesUploaded -= uploaded
 			rm.Locked = rm.Locked.Sub(formation.RenterAllowance)
 			rm.Spent = rm.Spent.Sub(formation.RenterContractPrice)
 			rm.Tax = rm.Tax.Sub(formation.RenterTax)
@@ -184,13 +194,16 @@ func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state met
 			rm.ActiveContracts++
 			rm.ActiveSize += resolution.Size
 			rm.Locked = rm.Locked.Add(resolution.RenterAllowance)
+			rm.Spent = rm.Spent.Sub(resolution.RenterDeferredSpend)
 
 			gm, err := getMetrics(ctx, tx, state.Timestamp)
 			if err != nil {
 				return fmt.Errorf("failed to get global metrics: %w", err)
 			}
 			gm.ActiveContracts++
+			gm.ActiveSize += resolution.Size
 			gm.LockedAllowance = gm.LockedAllowance.Add(resolution.RenterAllowance)
+			gm.SpentAllowance = gm.SpentAllowance.Sub(resolution.RenterDeferredSpend)
 			gm.EarnedRevenue = gm.EarnedRevenue.Sub(resolution.HostEarnedRevenue)
 			gm.BurntCollateral = gm.BurntCollateral.Sub(resolution.HostBurn)
 			gm.PotentialRevenue = gm.PotentialRevenue.Add(resolution.HostPotentialRevenue)
@@ -238,6 +251,16 @@ func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state met
 func (s *Store) ApplyState(ctx context.Context, tip types.ChainIndex, state metrics.State) error {
 	return s.transaction(ctx, func(ctx context.Context, tx *txn) error {
 		for _, formation := range state.Formations {
+			// Renewal-created contracts carry the parent's stored bytes
+			// forward without any new upload. The parent's resolution
+			// already released ActiveSize, and we re-acquire it here, but
+			// BytesUploaded must not double-count those bytes — they were
+			// charged when the parent was formed/grew.
+			var uploaded uint64
+			if !formation.FromRenewal {
+				uploaded = formation.Size
+			}
+
 			gm, err := getMetrics(ctx, tx, state.Timestamp)
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return fmt.Errorf("failed to get global metrics: %w", err)
@@ -245,7 +268,7 @@ func (s *Store) ApplyState(ctx context.Context, tip types.ChainIndex, state metr
 			gm.ActiveContracts++
 			gm.ActiveSize += formation.Size
 			gm.TotalSize += formation.Size
-			gm.BytesUploaded += formation.Size
+			gm.BytesUploaded += uploaded
 			gm.LockedAllowance = gm.LockedAllowance.Add(formation.RenterAllowance)
 			gm.SpentAllowance = gm.SpentAllowance.Add(formation.RenterContractPrice)
 			gm.Tax = gm.Tax.Add(formation.RenterTax)
@@ -263,7 +286,7 @@ func (s *Store) ApplyState(ctx context.Context, tip types.ChainIndex, state metr
 			hm.ActiveContracts++
 			hm.ActiveSize += formation.Size
 			hm.TotalSize += formation.Size
-			hm.BytesUploaded += formation.Size
+			hm.BytesUploaded += uploaded
 			hm.LockedCollateral = hm.LockedCollateral.Add(formation.HostLockedCollateral)
 			hm.RiskedCollateral = hm.RiskedCollateral.Add(formation.HostRiskedCollateral)
 			hm.PotentialRevenue = hm.PotentialRevenue.Add(formation.HostPotentialRevenue)
@@ -283,7 +306,7 @@ func (s *Store) ApplyState(ctx context.Context, tip types.ChainIndex, state metr
 			rm.ActiveContracts++
 			rm.ActiveSize += formation.Size
 			rm.TotalSize += formation.Size
-			rm.BytesUploaded += formation.Size
+			rm.BytesUploaded += uploaded
 			rm.Locked = rm.Locked.Add(formation.RenterAllowance)
 			rm.Spent = rm.Spent.Add(formation.RenterContractPrice)
 			rm.Tax = rm.Tax.Add(formation.RenterTax)
@@ -396,6 +419,7 @@ func (s *Store) ApplyState(ctx context.Context, tip types.ChainIndex, state metr
 			rm.ActiveContracts--
 			rm.ActiveSize -= resolution.Size
 			rm.Locked = rm.Locked.Sub(resolution.RenterAllowance)
+			rm.Spent = rm.Spent.Add(resolution.RenterDeferredSpend)
 			if rm.FirstSeen.IsZero() {
 				rm.FirstSeen = state.Timestamp
 			}
@@ -407,7 +431,9 @@ func (s *Store) ApplyState(ctx context.Context, tip types.ChainIndex, state metr
 				return fmt.Errorf("failed to get global metrics: %w", err)
 			}
 			gm.ActiveContracts--
+			gm.ActiveSize -= resolution.Size
 			gm.LockedAllowance = gm.LockedAllowance.Sub(resolution.RenterAllowance)
+			gm.SpentAllowance = gm.SpentAllowance.Add(resolution.RenterDeferredSpend)
 			gm.EarnedRevenue = gm.EarnedRevenue.Add(resolution.HostEarnedRevenue)
 			gm.BurntCollateral = gm.BurntCollateral.Add(resolution.HostBurn)
 			gm.PotentialRevenue = gm.PotentialRevenue.Sub(resolution.HostPotentialRevenue)

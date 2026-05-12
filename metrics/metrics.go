@@ -28,8 +28,6 @@ const (
 	ResolutionTypeAbandoned
 )
 
-const blockPruneDays = 7
-
 type (
 	// A ContractResolutionType represents the type of contract resolution.
 	ContractResolutionType uint8
@@ -91,9 +89,11 @@ type (
 		BytesUploaded uint64 `json:"bytesUploaded"`
 
 		// Spent is the cumulative SC the renter has paid to hosts via
-		// contracts — the upfront contract price at each formation plus
-		// the allowance consumed by storage revisions. It does not
-		// include Tax or miner fees.
+		// contracts: the upfront contract price at each formation, the
+		// allowance consumed by on-chain storage revisions, and the
+		// off-chain accrual surfaced at each renewal resolution (see
+		// ContractResolution.RenterDeferredSpend). Does not include Tax
+		// or miner fees.
 		Spent  types.Currency `json:"spent"`
 		Locked types.Currency `json:"locked"`
 		// Tax is the cumulative siafund tax the renter has paid on contract
@@ -163,6 +163,12 @@ type (
 		Host   types.PublicKey
 		Renter types.PublicKey
 		Size   uint64
+		// FromRenewal is true when this contract was created as the result
+		// of a V2FileContractRenewal of an existing contract. The new
+		// contract carries the parent's stored bytes forward without any
+		// new upload, so the formation does not contribute to BytesUploaded
+		// (those bytes were counted when the parent was formed/grew).
+		FromRenewal bool
 
 		// RenterAllowance is the refundable allowance locked into the
 		// contract at formation (= RenterOutput.Value).
@@ -213,6 +219,19 @@ type (
 		// On any resolution path it stops being locked; on a renewal
 		// the RenterRollover portion is re-locked into the new contract.
 		RenterAllowance types.Currency
+		// RenterDeferredSpend is the renter's off-chain spending on this
+		// contract that the metric model couldn't observe during its life,
+		// surfaced at a renewal resolution. It is the gap between the latest
+		// off-chain RiskedHostRevenue (reconstructed from the resolution as
+		// FinalHostOutput.Value + HostRollover − parent.TotalCollateral) and
+		// the on-chain parent.RiskedHostRevenue() — i.e., the SC the renter
+		// paid into host revenue via off-chain revisions between the parent's
+		// last on-chain state and the renewal. Only set on renewal-type
+		// resolutions; zero otherwise. Credited to rm.Spent and
+		// gm.SpentAllowance at apply time so renter cumulative spending
+		// telescopes through renewal lineages instead of falling behind host
+		// EarnedRevenue.
+		RenterDeferredSpend types.Currency
 
 		HostLockedCollateral types.Currency
 		HostRiskedCollateral types.Currency
@@ -278,11 +297,15 @@ type (
 
 	// A Manager provides access to the metrics and manages the indexing of the chain state.
 	Manager struct {
-		tg    *threadgroup.ThreadGroup
-		chain Chain
-		store Store
-		log   *zap.Logger
+		tg                   *threadgroup.ThreadGroup
+		chain                Chain
+		store                Store
+		log                  *zap.Logger
+		pruneRetentionBlocks uint64
 	}
+
+	// ManagerOption configures the metrics Manager.
+	ManagerOption func(*Manager)
 )
 
 var (
@@ -310,39 +333,120 @@ func wellFormedV2Contract(fc types.V2FileContract) bool {
 		fc.TotalCollateral.Cmp(fc.HostOutput.Value) <= 0
 }
 
-func parseDiffs(timestamp time.Time, cs consensus.State, diffs []consensus.V2FileContractElementDiff, log *zap.Logger) (State, error) {
+func minCurrency(a, b types.Currency) types.Currency {
+	if a.Cmp(b) < 0 {
+		return a
+	}
+	return b
+}
+
+func renewalCarriesRevenue(parent, renewal types.V2FileContract) bool {
+	return parent.ProofHeight == renewal.ProofHeight &&
+		parent.ExpirationHeight == renewal.ExpirationHeight
+}
+
+// renewalRevenue partitions the parent contract's latest off-chain
+// RiskedHostRevenue between settlement at this resolution (earnedRevenue) and
+// roll-forward into the new contract (the implicit difference, equal to
+// latest − earned). Returns:
+//
+//   - newRevenue:    the portion of the new contract's RiskedHostRevenue that
+//     is new (not rolled from the parent). This is the renter's
+//     new ContractPrice for the renewed contract.
+//   - earnedRevenue: the portion of the parent's latest RiskedHostRevenue that
+//     the host realizes at this resolution.
+//
+// The on-chain parent's HostOutput.Value, RenterOutput.Value, and
+// MissedHostValue may be stale relative to the latest signed off-chain
+// revision — v2 revisions are off-chain by default and only TotalCollateral,
+// ProofHeight, ExpirationHeight, and the public keys are consensus-immutable
+// across revisions. The latest off-chain HostOutput.Value is recoverable from
+// the resolution as FinalHostOutput.Value + HostRollover, per the rhp4
+// per-side conservation convention (core/rhp/v4: RenewContract,
+// RefreshContractPartialRollover, RefreshContractFullRollover all preserve
+// per-side balance even though consensus only enforces the four-way sum).
+//
+// Preconditions (caller's responsibility): parent and renewal.NewContract are
+// well-formed, and the latest off-chain RiskedHostRevenue is ≥ the on-chain
+// parent's — i.e. the renewal was produced by rhp4 and reflects a valid
+// non-regressing v2 lineage. Violations are filtered upstream in parseDiffs
+// as abandoned resolutions.
+func renewalRevenue(parent types.V2FileContract, renewal *types.V2FileContractRenewal) (newRevenue, earnedRevenue types.Currency) {
+	finalHostValue := renewal.FinalHostOutput.Value.Add(renewal.HostRollover)
+	finalPotentialRevenue := finalHostValue.Sub(parent.TotalCollateral)
+	newPotentialRevenue := renewal.NewContract.RiskedHostRevenue()
+
+	// Duration-extending renewal (RenewContract): HostRollover = min(parent.TC,
+	// new.TC) ≤ parent.TC, so no revenue rolls forward — the full latest
+	// RiskedHostRevenue settles at this resolution.
+	if !renewalCarriesRevenue(parent, renewal.NewContract) {
+		return newPotentialRevenue, finalPotentialRevenue
+	}
+
+	// Refresh (RefreshContractFullRollover or RefreshContractPartialRollover):
+	// the entire latest RiskedHostRevenue rolls into the new contract; nothing
+	// settles as earned at this resolution. In partial-rollover refreshes where
+	// rp.Collateral < parent.MissedHostValue, FinalHostOutput.Value > 0
+	// represents released unrisked collateral, not earned revenue.
+	rolledRevenue := minCurrency(finalPotentialRevenue, newPotentialRevenue)
+	return newPotentialRevenue.Sub(rolledRevenue), finalPotentialRevenue.Sub(rolledRevenue)
+}
+
+// parseDiffs walks a block's v2 transactions and emits the metric events they
+// produce. In v2 every contract event — formation, revision, resolution
+// (renewal, storage proof, expiration) — is submitted via a transaction;
+// consensus does not synthesize any of them. Iterating transactions directly
+// (rather than per-contract chain diffs) lets the renewal branch emit both
+// the parent's resolution and the new contract's formation from one call
+// site, removing the need to cross-reference a separate "Created" event.
+func parseDiffs(timestamp time.Time, cs consensus.State, txns []types.V2Transaction, log *zap.Logger) (State, error) {
 	state := State{
 		Timestamp: timestamp.Truncate(time.Hour),
 	}
-	for _, diff := range diffs {
-		log := log.With(zap.Stringer("id", diff.V2FileContractElement.ID))
-		fc := diff.V2FileContractElement.V2FileContract
-		// Skip contracts that don't fit the standard payout decomposition.
-		// Consensus allows MissedHostValue > TotalCollateral, but the metric
-		// model can't attribute such a contract's payouts to collateral vs.
-		// revenue, and fc.RiskedCollateral() would underflow. Since consensus
-		// makes TotalCollateral immutable and only allows MissedHostValue to
-		// decrease, a well-formed parent implies a well-formed revision, so
-		// checking the parent here covers formations, revisions, and
-		// resolutions consistently.
-		if !wellFormedV2Contract(fc) {
-			log.Warn("skipping malformed v2 contract", zap.Stringer("missedHostValue", fc.MissedHostValue), zap.Stringer("totalCollateral", fc.TotalCollateral), zap.Stringer("hostOutput", fc.HostOutput.Value))
+	for _, txn := range txns {
+		txnID := txn.ID()
+
+		// A v2 contract-bearing transaction carries exactly one contract event:
+		// one formation, one revision, or one resolution — never a mix and
+		// never more than one of a kind. The rhp4/wallet code never produces
+		// other shapes, and the metric model is built around this invariant
+		// (notably, the renewal branch below emits both the resolution and
+		// the renewal-created formation, which would double-count if there
+		// were also a separate formation entry on the same transaction). Skip
+		// any transaction that violates the invariant rather than silently
+		// producing inconsistent counters.
+		nFormations := len(txn.FileContracts)
+		nRevisions := len(txn.FileContractRevisions)
+		nResolutions := len(txn.FileContractResolutions)
+		if nFormations+nRevisions+nResolutions > 1 {
+			log.Warn("skipping v2 transaction with multiple contract events",
+				zap.Stringer("txnID", txnID),
+				zap.Int("formations", nFormations),
+				zap.Int("revisions", nRevisions),
+				zap.Int("resolutions", nResolutions))
 			continue
 		}
-		if diff.Created {
-			// RenterContractPrice is the SC the renter has already paid the
-			// host at formation. At a fresh formation this equals the contract
-			// price; at a renewal it also includes any pre-paid storage cost
-			// that was rolled into HostOutput.Value. Since MissedHostValue ==
-			// TotalCollateral at standard formations, this equals
-			// fc.RiskedHostRevenue() but is computed explicitly to be robust
-			// to non-standard contracts where they differ.
+
+		// Fresh formations. txn.FileContracts only contains contracts created
+		// from scratch in this transaction; renewal-created contracts come
+		// through txn.FileContractResolutions below.
+		for i, fc := range txn.FileContracts {
+			log := log.With(zap.Stringer("id", txn.V2FileContractID(txnID, i)))
+			// Skip contracts that don't fit the standard payout decomposition.
+			// Consensus allows MissedHostValue > TotalCollateral, but the metric
+			// model can't attribute such a contract's payouts to collateral vs.
+			// revenue, and fc.RiskedCollateral() would underflow.
+			if !wellFormedV2Contract(fc) {
+				log.Warn("skipping malformed v2 contract", zap.Stringer("missedHostValue", fc.MissedHostValue), zap.Stringer("totalCollateral", fc.TotalCollateral), zap.Stringer("hostOutput", fc.HostOutput.Value))
+				continue
+			}
 			renterContractPrice := fc.HostOutput.Value.Sub(fc.TotalCollateral)
 			renterTax := cs.V2FileContractTax(fc)
 			state.Formations = append(state.Formations, ContractFormation{
-				Host:   fc.HostPublicKey,
-				Renter: fc.RenterPublicKey,
-				Size:   fc.Filesize,
+				Host:        fc.HostPublicKey,
+				Renter:      fc.RenterPublicKey,
+				Size:        fc.Filesize,
+				FromRenewal: false,
 
 				RenterAllowance:     fc.RemainingAllowance(),
 				RenterContractPrice: renterContractPrice,
@@ -353,22 +457,28 @@ func parseDiffs(timestamp time.Time, cs consensus.State, diffs []consensus.V2Fil
 				HostPotentialRevenue: fc.RiskedHostRevenue(),
 			})
 			log.Debug("contract formation", zap.Stringer("host", fc.HostPublicKey), zap.Stringer("renter", fc.RenterPublicKey), zap.Stringer("allowance", fc.RemainingAllowance()), zap.Stringer("contractPrice", renterContractPrice), zap.Stringer("tax", renterTax), zap.Stringer("collateral", fc.RiskedCollateral()), zap.Stringer("revenue", fc.RiskedHostRevenue()))
-		} else if rev, ok := diff.V2RevisionElement(); ok {
-			// The parent fc passed wellFormedV2Contract above, but a revision
-			// can redistribute HostOutput.Value into RenterOutput.Value (while
-			// preserving their sum), which consensus does not check against
-			// TotalCollateral. If the revision lands in a state where
-			// TotalCollateral > HostOutput.Value, rev.RiskedHostRevenue() would
-			// underflow. We can't safely record this revision and won't be
-			// able to safely process any subsequent diffs for this contract
-			// either (the parent fc on the next block will be malformed and
-			// fail the top-of-loop check). Synthesize an abandonment
-			// resolution so the contract stops being counted as active. We
-			// use the last well-formed state (fc) as the basis for the
-			// counters being released; HostBurn and HostEarnedRevenue stay
-			// zero because no actual chain settlement occurred.
-			if !wellFormedV2Contract(rev.V2FileContract) {
-				log.Warn("abandoning v2 contract after malformed revision", zap.Stringer("missedHostValue", rev.V2FileContract.MissedHostValue), zap.Stringer("totalCollateral", rev.V2FileContract.TotalCollateral), zap.Stringer("hostOutput", rev.V2FileContract.HostOutput.Value))
+		}
+
+		// On-chain revisions.
+		for _, rev := range txn.FileContractRevisions {
+			log := log.With(zap.Stringer("id", rev.Parent.ID))
+			fc := rev.Parent.V2FileContract
+			if !wellFormedV2Contract(fc) {
+				log.Warn("skipping malformed v2 contract", zap.Stringer("missedHostValue", fc.MissedHostValue), zap.Stringer("totalCollateral", fc.TotalCollateral), zap.Stringer("hostOutput", fc.HostOutput.Value))
+				continue
+			}
+			// A revision can redistribute HostOutput.Value into
+			// RenterOutput.Value (preserving the sum), which consensus does
+			// not check against TotalCollateral. If the revision lands in a
+			// state where TotalCollateral > HostOutput.Value,
+			// rev.RiskedHostRevenue() would underflow. We can't safely record
+			// the revision and won't be able to safely process any subsequent
+			// events for this contract either. Synthesize an abandonment
+			// resolution so the contract stops being counted as active.
+			// HostBurn and HostEarnedRevenue stay zero because no actual chain
+			// settlement occurred.
+			if !wellFormedV2Contract(rev.Revision) {
+				log.Warn("abandoning v2 contract after malformed revision", zap.Stringer("missedHostValue", rev.Revision.MissedHostValue), zap.Stringer("totalCollateral", rev.Revision.TotalCollateral), zap.Stringer("hostOutput", rev.Revision.HostOutput.Value))
 				state.Resolutions = append(state.Resolutions, ContractResolution{
 					Host:                 fc.HostPublicKey,
 					Renter:               fc.RenterPublicKey,
@@ -386,19 +496,30 @@ func parseDiffs(timestamp time.Time, cs consensus.State, diffs []consensus.V2Fil
 				Renter: fc.RenterPublicKey,
 
 				ExistingSize: fc.Filesize,
-				NewSize:      rev.V2FileContract.Filesize,
+				NewSize:      rev.Revision.Filesize,
 
 				ExistingAllowance: fc.RemainingAllowance(),
-				NewAllowance:      rev.V2FileContract.RemainingAllowance(),
+				NewAllowance:      rev.Revision.RemainingAllowance(),
 
 				ExistingRiskedCollateral: fc.RiskedCollateral(),
-				NewRiskedCollateral:      rev.V2FileContract.RiskedCollateral(),
+				NewRiskedCollateral:      rev.Revision.RiskedCollateral(),
 
 				ExistingPotentialRevenue: fc.RiskedHostRevenue(),
-				NewPotentialRevenue:      rev.V2FileContract.RiskedHostRevenue(),
+				NewPotentialRevenue:      rev.Revision.RiskedHostRevenue(),
 			})
-			log.Debug("contract revision", zap.Uint64("revisionNumber", rev.V2FileContract.RevisionNumber), zap.Stringer("allowance", rev.V2FileContract.RemainingAllowance()), zap.Stringer("existingRisked", fc.RiskedCollateral()), zap.Stringer("newRisked", rev.V2FileContract.RiskedCollateral()), zap.Stringer("revenue", rev.V2FileContract.RiskedHostRevenue()), zap.Stringer("host", fc.HostPublicKey), zap.Stringer("renter", fc.RenterPublicKey))
-		} else if res := diff.Resolution; res != nil {
+			log.Debug("contract revision", zap.Uint64("revisionNumber", rev.Revision.RevisionNumber), zap.Stringer("allowance", rev.Revision.RemainingAllowance()), zap.Stringer("existingRisked", fc.RiskedCollateral()), zap.Stringer("newRisked", rev.Revision.RiskedCollateral()), zap.Stringer("revenue", rev.Revision.RiskedHostRevenue()), zap.Stringer("host", fc.HostPublicKey), zap.Stringer("renter", fc.RenterPublicKey))
+		}
+
+		// Resolutions. Renewals also emit the new contract's formation here,
+		// inline, so FromRenewal can be set with certainty rather than via a
+		// cross-reference lookup.
+		for _, fcr := range txn.FileContractResolutions {
+			log := log.With(zap.Stringer("id", fcr.Parent.ID))
+			fc := fcr.Parent.V2FileContract
+			if !wellFormedV2Contract(fc) {
+				log.Warn("skipping malformed v2 contract", zap.Stringer("missedHostValue", fc.MissedHostValue), zap.Stringer("totalCollateral", fc.TotalCollateral), zap.Stringer("hostOutput", fc.HostOutput.Value))
+				continue
+			}
 			cr := ContractResolution{
 				Host:   fc.HostPublicKey,
 				Renter: fc.RenterPublicKey,
@@ -411,7 +532,7 @@ func parseDiffs(timestamp time.Time, cs consensus.State, diffs []consensus.V2Fil
 				HostPotentialRevenue: fc.RiskedHostRevenue(),
 			}
 
-			switch res := res.(type) {
+			switch res := fcr.Resolution.(type) {
 			case *types.V2FileContractExpiration:
 				cr.Type = ResolutionTypeExpired
 				cr.HostBurn = fc.HostOutput.Value.Sub(fc.MissedHostValue)
@@ -423,28 +544,68 @@ func parseDiffs(timestamp time.Time, cs consensus.State, diffs []consensus.V2Fil
 				// contract (enforcing TotalCollateral ≤ HostOutput.Value)
 				// but does not enforce MissedHostValue ≤ TotalCollateral,
 				// so the new contract can still fail wellFormedV2Contract.
-				// In that case the new contract will be skipped at its
-				// own Created diff, leaving the lineage untrackable. We
-				// classify this as an abandonment rather than a renewal
-				// so we don't credit RenewedContracts for a renewal whose
-				// successor we can't account for. Active-counter releases
-				// for the old contract still apply (handled in sqlite).
+				// Classify as abandonment so we don't credit RenewedContracts
+				// for a renewal whose successor we can't account for; the
+				// active-counter release for the old contract still applies.
 				if !wellFormedV2Contract(res.NewContract) {
 					log.Warn("abandoning v2 contract: renewal produced malformed new contract", zap.Stringer("missedHostValue", res.NewContract.MissedHostValue), zap.Stringer("totalCollateral", res.NewContract.TotalCollateral), zap.Stringer("hostOutput", res.NewContract.HostOutput.Value))
 					cr.Type = ResolutionTypeAbandoned
 					break
 				}
-				cr.Type = ResolutionTypeRenewed
-				if res.FinalHostOutput.Value.Cmp(fc.TotalCollateral) > 0 {
-					cr.HostEarnedRevenue = res.FinalHostOutput.Value.Sub(fc.TotalCollateral)
+				// rhp4 v2 revisions only ever move value from renter side to
+				// host side; the host never refunds. So the latest off-chain
+				// host value (reconstructable from the resolution via per-side
+				// conservation: FinalHostOutput.Value + HostRollover) must be
+				// at least the on-chain parent's HostOutput.Value, and the
+				// latest RiskedHostRevenue must be at least the parent's. A
+				// violation means the renewal wasn't produced by rhp4 — abandon
+				// so we don't credit the lineage with values we can't trust.
+				finalHostValue := res.FinalHostOutput.Value.Add(res.HostRollover)
+				latestPotentialRevenue, underflow := finalHostValue.SubWithUnderflow(fc.TotalCollateral)
+				if underflow || latestPotentialRevenue.Cmp(fc.RiskedHostRevenue()) < 0 {
+					log.Warn("abandoning v2 contract: renewal latest off-chain state regresses from on-chain parent", zap.Stringer("finalHostValue", finalHostValue), zap.Stringer("parentTotalCollateral", fc.TotalCollateral), zap.Stringer("parentRiskedHostRevenue", fc.RiskedHostRevenue()))
+					cr.Type = ResolutionTypeAbandoned
+					break
 				}
-				// The renter-side spend telescopes naturally: the rolled-over
-				// allowance is removed from this contract's Locked here and
-				// re-added by the new contract's formation entry, and the new
-				// contract's formation also records its own RenterContractPrice.
-				// We don't need a per-resolution renter-spend adjustment.
+				cr.Type = ResolutionTypeRenewed
+				// Refreshes carry old host revenue forward into the renewal
+				// contract; duration-extending renewals settle the old term.
+				// Revenue that remains potential in the new contract is not
+				// earned here.
+				newRevenue, earnedRevenue := renewalRevenue(fc, res)
+				cr.HostEarnedRevenue = earnedRevenue
+				// The renter's off-chain spend on the parent (since its last
+				// on-chain state) surfaces here as the gap between latest
+				// off-chain RiskedHostRevenue and on-chain. Credit it to
+				// Spent so renter cumulative spending tracks host
+				// EarnedRevenue across renewal lineages. Guaranteed
+				// non-negative by the validation above.
+				cr.RenterDeferredSpend = latestPotentialRevenue.Sub(fc.RiskedHostRevenue())
+
+				// Emit the renewal-created formation alongside the resolution.
+				// FromRenewal=true tells the sqlite layer not to count the
+				// new contract's filesize as freshly uploaded bytes (they
+				// were charged when the parent was originally formed/grew).
+				newFC := res.NewContract
+				newID := fcr.Parent.ID.V2RenewalID()
+				renewalLog := log.With(zap.Stringer("renewalID", newID), zap.Uint64("renewalProofHeight", newFC.ProofHeight))
+				state.Formations = append(state.Formations, ContractFormation{
+					Host:        newFC.HostPublicKey,
+					Renter:      newFC.RenterPublicKey,
+					Size:        newFC.Filesize,
+					FromRenewal: true,
+
+					RenterAllowance:     newFC.RemainingAllowance(),
+					RenterContractPrice: newRevenue,
+					RenterTax:           cs.V2FileContractTax(newFC),
+
+					HostLockedCollateral: newFC.TotalCollateral,
+					HostRiskedCollateral: newFC.RiskedCollateral(),
+					HostPotentialRevenue: newFC.RiskedHostRevenue(),
+				})
+				renewalLog.Debug("renewal-created formation", zap.Stringer("host", newFC.HostPublicKey), zap.Stringer("renter", newFC.RenterPublicKey), zap.Stringer("allowance", newFC.RemainingAllowance()), zap.Stringer("contractPrice", newRevenue), zap.Stringer("collateral", newFC.RiskedCollateral()), zap.Stringer("revenue", newFC.RiskedHostRevenue()))
 			default:
-				panic(fmt.Sprintf("unknown resolution type: %T", res)) // should never happen
+				panic(fmt.Sprintf("unknown resolution type: %T", fcr.Resolution)) // should never happen
 			}
 
 			state.Resolutions = append(state.Resolutions, cr)
@@ -467,14 +628,13 @@ func (m *Manager) indexState(ctx context.Context, tip types.ChainIndex) (types.C
 			return tip, nil
 		}
 
-		var cs consensus.State
 		for _, cru := range reverted {
 			revertIndex := types.ChainIndex{
 				Height: cru.State.Index.Height + 1,
 				ID:     cru.Block.ID(),
 			}
 			log := m.log.With(zap.Stringer("index", revertIndex)).Named("revert")
-			state, err := parseDiffs(cru.Block.Timestamp.Truncate(time.Hour), cru.State, cru.V2FileContractElementDiffs(), log)
+			state, err := parseDiffs(cru.Block.Timestamp.Truncate(time.Hour), cru.State, cru.Block.V2Transactions(), log)
 			if err != nil {
 				return types.ChainIndex{}, fmt.Errorf("failed to parse reverted diffs: %w", err)
 			}
@@ -484,14 +644,13 @@ func (m *Manager) indexState(ctx context.Context, tip types.ChainIndex) (types.C
 				return types.ChainIndex{}, fmt.Errorf("failed to revert state: %w", err)
 			}
 			tip = cru.State.Index
-			cs = cru.State
 			log.Debug("reverted state")
 		}
 
 		for _, cau := range applied {
 			timestamp := cau.Block.Timestamp.Truncate(time.Hour)
 			log := m.log.With(zap.Stringer("index", cau.State.Index), zap.Time("timestamp", timestamp)).Named("apply")
-			state, err := parseDiffs(timestamp, cau.State, cau.V2FileContractElementDiffs(), log)
+			state, err := parseDiffs(timestamp, cau.State, cau.Block.V2Transactions(), log)
 			if err != nil {
 				return types.ChainIndex{}, fmt.Errorf("failed to parse applied diffs: %w", err)
 			}
@@ -501,14 +660,14 @@ func (m *Manager) indexState(ctx context.Context, tip types.ChainIndex) (types.C
 				return types.ChainIndex{}, fmt.Errorf("failed to apply state: %w", err)
 			}
 			tip = cau.State.Index
-			cs = cau.State
 			log.Debug("applied state")
 		}
 
-		blocksPerDay := uint64((24 * time.Hour) / cs.Network.BlockInterval)
-		pruneTarget := blocksPerDay * blockPruneDays
-		if tip.Height > pruneTarget {
-			m.chain.PruneBlocks(tip.Height - pruneTarget)
+		// Pruning is opt-in (0 = disabled). When enabled, drop block bodies
+		// older than the configured retention window from the consensus
+		// database.
+		if m.pruneRetentionBlocks > 0 && tip.Height > m.pruneRetentionBlocks {
+			m.chain.PruneBlocks(tip.Height - m.pruneRetentionBlocks)
 		}
 	}
 }
@@ -581,13 +740,26 @@ func (m *Manager) Close() error {
 	return nil
 }
 
+// WithPruneRetentionBlocks configures how many recent blocks the chain manager
+// is asked to retain after each indexing pass. Older blocks are dropped from
+// the consensus database via Chain.PruneBlocks. A value of 0 (the default)
+// disables pruning entirely.
+func WithPruneRetentionBlocks(blocks uint64) ManagerOption {
+	return func(m *Manager) {
+		m.pruneRetentionBlocks = blocks
+	}
+}
+
 // NewManager creates a new metrics manager that indexes the chain state and provides access to metrics.
-func NewManager(chain Chain, store Store, log *zap.Logger) (*Manager, error) {
+func NewManager(chain Chain, store Store, log *zap.Logger, opts ...ManagerOption) (*Manager, error) {
 	m := &Manager{
 		chain: chain,
 		store: store,
 		log:   log.Named("metrics"),
 		tg:    threadgroup.New(),
+	}
+	for _, opt := range opts {
+		opt(m)
 	}
 
 	ctx, cancel, err := m.tg.AddContext(context.Background())

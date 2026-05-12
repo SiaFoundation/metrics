@@ -26,13 +26,15 @@ import (
 
 func main() {
 	var (
-		dir      string
-		logLevel zap.AtomicLevel
-		network  string
+		dir               string
+		logLevel          zap.AtomicLevel
+		network           string
+		pruneRetainBlocks uint64
 	)
 	flag.StringVar(&dir, "dir", ".", "Directory to store metrics data")
 	flag.StringVar(&network, "network", "mainnet", "Network to connect to (e.g. mainnet, testnet)")
 	flag.TextVar(&logLevel, "log.level", zap.NewAtomicLevelAt(zap.InfoLevel), "Set the logging level (e.g. debug, info, warn, error)")
+	flag.Uint64Var(&pruneRetainBlocks, "prune.blocks", 0, "Recent blocks to retain in the consensus database (0 = no pruning)")
 	flag.Parse()
 
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -104,7 +106,7 @@ func main() {
 	defer s.Close()
 	go s.Run()
 
-	metrics, err := metrics.NewManager(cm, store, log.Named("metrics"))
+	metrics, err := metrics.NewManager(cm, store, log.Named("metrics"), metrics.WithPruneRetentionBlocks(pruneRetainBlocks))
 	if err != nil {
 		log.Panic("failed to create metrics manager", zap.Error(err))
 	}
