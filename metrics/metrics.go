@@ -406,27 +406,6 @@ func parseDiffs(timestamp time.Time, cs consensus.State, txns []types.V2Transact
 	for _, txn := range txns {
 		txnID := txn.ID()
 
-		// A v2 contract-bearing transaction carries exactly one contract event:
-		// one formation, one revision, or one resolution — never a mix and
-		// never more than one of a kind. The rhp4/wallet code never produces
-		// other shapes, and the metric model is built around this invariant
-		// (notably, the renewal branch below emits both the resolution and
-		// the renewal-created formation, which would double-count if there
-		// were also a separate formation entry on the same transaction). Skip
-		// any transaction that violates the invariant rather than silently
-		// producing inconsistent counters.
-		nFormations := len(txn.FileContracts)
-		nRevisions := len(txn.FileContractRevisions)
-		nResolutions := len(txn.FileContractResolutions)
-		if nFormations+nRevisions+nResolutions > 1 {
-			log.Warn("skipping v2 transaction with multiple contract events",
-				zap.Stringer("txnID", txnID),
-				zap.Int("formations", nFormations),
-				zap.Int("revisions", nRevisions),
-				zap.Int("resolutions", nResolutions))
-			continue
-		}
-
 		// Fresh formations. txn.FileContracts only contains contracts created
 		// from scratch in this transaction; renewal-created contracts come
 		// through txn.FileContractResolutions below.

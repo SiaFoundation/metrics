@@ -307,57 +307,6 @@ func TestParseDiffsAbandonsRenewalWithRegressedRevenue(t *testing.T) {
 	assertCurrency(t, "abandoned deferred spend", state.Resolutions[0].RenterDeferredSpend, types.ZeroCurrency)
 }
 
-func TestParseDiffsSkipsMultiEventTransaction(t *testing.T) {
-	// rhp4/wallet code only ever produces v2 contract-bearing transactions
-	// with exactly one of: formation, revision, or resolution. A mixed
-	// transaction would either double-count (formation + renewal both
-	// produce a formation event) or be otherwise inconsistent with the
-	// metric model, so parseDiffs skips them outright.
-	fresh := testFileContract(100, 110, 64, testCurrency(100), testCurrency(200), testCurrency(200), testCurrency(7))
-	old := testFileContract(100, 110, 64, testCurrency(50), testCurrency(100), testCurrency(100), testCurrency(5))
-	revised := testFileContract(100, 110, 128, testCurrency(45), testCurrency(100), testCurrency(95), testCurrency(10))
-	revised.RevisionNumber = old.RevisionNumber + 1
-
-	cases := []struct {
-		name string
-		txn  types.V2Transaction
-	}{
-		{
-			"formation + revision",
-			types.V2Transaction{
-				FileContracts: []types.V2FileContract{fresh},
-				FileContractRevisions: []types.V2FileContractRevision{{
-					Parent:   types.V2FileContractElement{ID: testContractID(10), V2FileContract: old},
-					Revision: revised,
-				}},
-			},
-		},
-		{
-			"two formations",
-			types.V2Transaction{FileContracts: []types.V2FileContract{fresh, fresh}},
-		},
-		{
-			"formation + storage proof",
-			types.V2Transaction{
-				FileContracts: []types.V2FileContract{fresh},
-				FileContractResolutions: []types.V2FileContractResolution{{
-					Parent:     types.V2FileContractElement{ID: testContractID(11), V2FileContract: old},
-					Resolution: &types.V2StorageProof{},
-				}},
-			},
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			state := testParseDiffs(t, []types.V2Transaction{tc.txn})
-			if len(state.Formations)+len(state.Revisions)+len(state.Resolutions) != 0 {
-				t.Fatalf("expected no events from skipped txn, got %d formations / %d revisions / %d resolutions",
-					len(state.Formations), len(state.Revisions), len(state.Resolutions))
-			}
-		})
-	}
-}
-
 func TestParseDiffsRevisionAndResolutionBothProcessed(t *testing.T) {
 	old := testFileContract(100, 110, 64, testCurrency(50), testCurrency(100), testCurrency(100), testCurrency(5))
 	revised := testFileContract(100, 110, 128, testCurrency(45), testCurrency(100), testCurrency(95), testCurrency(10))
