@@ -184,6 +184,18 @@ func (a *api) handleTopHosts(jc jape.Context) {
 	ctx := jc.Request.Context()
 	end := time.Now().Truncate(time.Hour)
 	start := end.AddDate(0, -1, 0) // one month ago
+	// Optional start/end let callers align the ranking window with
+	// /metrics and /summary; bounds default to the prior 30-day behavior.
+	if err := jc.DecodeForm("start", &start); err != nil {
+		return
+	}
+	if err := jc.DecodeForm("end", &end); err != nil {
+		return
+	}
+	if !end.After(start) {
+		jc.Error(errors.New("end must be after start"), http.StatusBadRequest)
+		return
+	}
 
 	// ?sort=size ranks by the host's most recent active_size in the window;
 	// the default ranks by earned_revenue.
@@ -215,6 +227,18 @@ func (a *api) handleTopRenters(jc jape.Context) {
 	ctx := jc.Request.Context()
 	end := time.Now().Truncate(time.Hour)
 	start := end.AddDate(0, -1, 0) // one month ago
+	// Optional start/end let callers align the ranking window with
+	// /metrics and /summary; bounds default to the prior 30-day behavior.
+	if err := jc.DecodeForm("start", &start); err != nil {
+		return
+	}
+	if err := jc.DecodeForm("end", &end); err != nil {
+		return
+	}
+	if !end.After(start) {
+		jc.Error(errors.New("end must be after start"), http.StatusBadRequest)
+		return
+	}
 
 	// ?sort=size ranks by the renter's most recent active_size in the
 	// window; the default ranks by spent_allowance.
