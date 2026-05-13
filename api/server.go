@@ -25,6 +25,8 @@ type (
 
 		TopHosts(context.Context, time.Time, time.Time, int) ([]metrics.Host, error)
 		TopRenters(context.Context, time.Time, time.Time, int) ([]metrics.Renter, error)
+		TopHostsBySize(context.Context, time.Time, time.Time, int) ([]metrics.Host, error)
+		TopRentersBySize(context.Context, time.Time, time.Time, int) ([]metrics.Renter, error)
 
 		HostsCount(context.Context, time.Time, time.Time) (int64, error)
 		RentersCount(context.Context, time.Time, time.Time) (int64, error)
@@ -183,7 +185,26 @@ func (a *api) handleTopHosts(jc jape.Context) {
 	end := time.Now().Truncate(time.Hour)
 	start := end.AddDate(0, -1, 0) // one month ago
 
-	hosts, err := a.metrics.TopHosts(ctx, start, end, 50)
+	// ?sort=size ranks by the host's most recent active_size in the window;
+	// the default ranks by earned_revenue.
+	var sort string
+	if err := jc.DecodeForm("sort", &sort); err != nil {
+		return
+	}
+
+	var (
+		hosts []metrics.Host
+		err   error
+	)
+	switch sort {
+	case "", "revenue":
+		hosts, err = a.metrics.TopHosts(ctx, start, end, 50)
+	case "size":
+		hosts, err = a.metrics.TopHostsBySize(ctx, start, end, 50)
+	default:
+		jc.Error(errors.New("sort must be one of: revenue, size"), http.StatusBadRequest)
+		return
+	}
 	if jc.Check("failed to get top hosts", err) != nil {
 		return
 	}
@@ -195,7 +216,26 @@ func (a *api) handleTopRenters(jc jape.Context) {
 	end := time.Now().Truncate(time.Hour)
 	start := end.AddDate(0, -1, 0) // one month ago
 
-	renters, err := a.metrics.TopRenters(ctx, start, end, 50)
+	// ?sort=size ranks by the renter's most recent active_size in the
+	// window; the default ranks by spent_allowance.
+	var sort string
+	if err := jc.DecodeForm("sort", &sort); err != nil {
+		return
+	}
+
+	var (
+		renters []metrics.Renter
+		err     error
+	)
+	switch sort {
+	case "", "spending":
+		renters, err = a.metrics.TopRenters(ctx, start, end, 50)
+	case "size":
+		renters, err = a.metrics.TopRentersBySize(ctx, start, end, 50)
+	default:
+		jc.Error(errors.New("sort must be one of: spending, size"), http.StatusBadRequest)
+		return
+	}
 	if jc.Check("failed to get top renters", err) != nil {
 		return
 	}

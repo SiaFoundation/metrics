@@ -640,11 +640,14 @@ func (s *Store) NewRenters(ctx context.Context, start, end time.Time) (n int64, 
 	return
 }
 
-// TopHosts retrieves the top hosts based on earned revenue within a specified time range.
-// The results are limited to the specified number of hosts.
+// TopHosts retrieves the top hosts ranked by their most recent earned_revenue
+// in [start, end]. The latest snapshot per host is selected via SQLite's
+// bare-columns-with-max() rule: max(date_created) drags every other bare
+// column along from the latest row in each group, so ORDER BY earned_revenue
+// then sorts on that latest snapshot's value.
 func (s *Store) TopHosts(ctx context.Context, start, end time.Time, limit int) (ms []metrics.Host, err error) {
 	err = s.transaction(ctx, func(ctx context.Context, tx *txn) error {
-		rows, err := tx.Query(ctx, `SELECT host_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, revision_count, active_size, total_size, bytes_uploaded, burnt_collateral, locked_collateral, risked_collateral, potential_revenue, earned_revenue, first_seen, last_active, date_created
+		rows, err := tx.Query(ctx, `SELECT host_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, revision_count, active_size, total_size, bytes_uploaded, burnt_collateral, locked_collateral, risked_collateral, potential_revenue, earned_revenue, first_seen, last_active, max(date_created)
 FROM host_metrics WHERE date_created BETWEEN $1 AND $2 GROUP BY host_key ORDER BY earned_revenue DESC LIMIT $3;`,
 			sqlTime(start), sqlTime(end), limit)
 		if err != nil {
@@ -664,15 +667,66 @@ FROM host_metrics WHERE date_created BETWEEN $1 AND $2 GROUP BY host_key ORDER B
 	return
 }
 
-// TopRenters retrieves the top renters based on spent allowance within a specified time range.
-// The results are limited to the specified number of renters.
+// TopRenters retrieves the top renters ranked by their most recent
+// spent_allowance in [start, end]. See TopHosts for how the latest snapshot
+// per key is selected.
 func (s *Store) TopRenters(ctx context.Context, start, end time.Time, limit int) (ms []metrics.Renter, err error) {
 	err = s.transaction(ctx, func(ctx context.Context, tx *txn) error {
-		rows, err := tx.Query(ctx, `SELECT renter_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, revision_count, active_size, total_size, bytes_uploaded, locked_allowance, max(spent_allowance), tax, first_seen, last_active, date_created
+		rows, err := tx.Query(ctx, `SELECT renter_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, revision_count, active_size, total_size, bytes_uploaded, locked_allowance, spent_allowance, tax, first_seen, last_active, max(date_created)
 FROM renter_metrics WHERE date_created BETWEEN $1 AND $2 GROUP BY renter_key ORDER BY spent_allowance DESC LIMIT $3;`,
 			sqlTime(start), sqlTime(end), limit)
 		if err != nil {
 			return fmt.Errorf("failed to query top renters: %w", err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			m, err := scanRenter(rows)
+			if err != nil {
+				return fmt.Errorf("failed to scan renter metrics: %w", err)
+			}
+			ms = append(ms, m)
+		}
+		return rows.Err()
+	})
+	return
+}
+
+// TopHostsBySize retrieves the top hosts ranked by their most recent
+// active_size in [start, end]. See TopHosts for how the latest snapshot per
+// key is selected.
+func (s *Store) TopHostsBySize(ctx context.Context, start, end time.Time, limit int) (ms []metrics.Host, err error) {
+	err = s.transaction(ctx, func(ctx context.Context, tx *txn) error {
+		rows, err := tx.Query(ctx, `SELECT host_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, revision_count, active_size, total_size, bytes_uploaded, burnt_collateral, locked_collateral, risked_collateral, potential_revenue, earned_revenue, first_seen, last_active, max(date_created)
+FROM host_metrics WHERE date_created BETWEEN $1 AND $2 GROUP BY host_key ORDER BY active_size DESC LIMIT $3;`,
+			sqlTime(start), sqlTime(end), limit)
+		if err != nil {
+			return fmt.Errorf("failed to query top hosts by size: %w", err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			m, err := scanHost(rows)
+			if err != nil {
+				return fmt.Errorf("failed to scan host metrics: %w", err)
+			}
+			ms = append(ms, m)
+		}
+		return rows.Err()
+	})
+	return
+}
+
+// TopRentersBySize retrieves the top renters ranked by their most recent
+// active_size in [start, end]. See TopHostsBySize for how the latest snapshot
+// per key is selected.
+func (s *Store) TopRentersBySize(ctx context.Context, start, end time.Time, limit int) (ms []metrics.Renter, err error) {
+	err = s.transaction(ctx, func(ctx context.Context, tx *txn) error {
+		rows, err := tx.Query(ctx, `SELECT renter_key, active_contracts, renewed_contracts, successful_contracts, failed_contracts, revision_count, active_size, total_size, bytes_uploaded, locked_allowance, spent_allowance, tax, first_seen, last_active, max(date_created)
+FROM renter_metrics WHERE date_created BETWEEN $1 AND $2 GROUP BY renter_key ORDER BY active_size DESC LIMIT $3;`,
+			sqlTime(start), sqlTime(end), limit)
+		if err != nil {
+			return fmt.Errorf("failed to query top renters by size: %w", err)
 		}
 		defer rows.Close()
 

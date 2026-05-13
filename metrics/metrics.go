@@ -283,6 +283,10 @@ type (
 
 		TopHosts(ctx context.Context, start, end time.Time, limit int) ([]Host, error)
 		TopRenters(ctx context.Context, start, end time.Time, limit int) ([]Renter, error)
+		// TopHostsBySize / TopRentersBySize rank by the latest active_size
+		// snapshot in [start, end] rather than by revenue / spending.
+		TopHostsBySize(ctx context.Context, start, end time.Time, limit int) ([]Host, error)
+		TopRentersBySize(ctx context.Context, start, end time.Time, limit int) ([]Renter, error)
 
 		RenterMetrics(ctx context.Context, renterKey types.PublicKey, start, end time.Time) ([]Renter, error)
 		HostMetrics(ctx context.Context, hostKey types.PublicKey, start, end time.Time) ([]Host, error)
@@ -660,6 +664,18 @@ func (m *Manager) TopHosts(ctx context.Context, start, end time.Time, limit int)
 // TopRenters retrieves the top renters based on their metrics over a time range.
 func (m *Manager) TopRenters(ctx context.Context, start, end time.Time, limit int) ([]Renter, error) {
 	return m.store.TopRenters(ctx, start, end, limit)
+}
+
+// TopHostsBySize retrieves the top hosts ranked by their most recent
+// active_size in [start, end].
+func (m *Manager) TopHostsBySize(ctx context.Context, start, end time.Time, limit int) ([]Host, error) {
+	return m.store.TopHostsBySize(ctx, start, end, limit)
+}
+
+// TopRentersBySize retrieves the top renters ranked by their most recent
+// active_size in [start, end].
+func (m *Manager) TopRentersBySize(ctx context.Context, start, end time.Time, limit int) ([]Renter, error) {
+	return m.store.TopRentersBySize(ctx, start, end, limit)
 }
 
 // HostsCount retrieves the count of hosts over a time range.
