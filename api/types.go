@@ -19,15 +19,15 @@ type UsageSummaryResponse struct {
 	NewRenters uint64 `json:"newRenters"`
 
 	// Period deltas of cumulative counters: end-of-period minus start-of-period.
-	NewContracts     uint64         `json:"newContracts"`
-	Transactions     uint64         `json:"transactions"`
-	Revisions        uint64         `json:"revisions"`
-	BytesUploaded    uint64         `json:"bytesUploaded"`
-	ActiveByteDays   uint64         `json:"activeByteDays"`
-	RenterSpending   types.Currency `json:"renterSpending"`
+	NewContracts      uint64         `json:"newContracts"`
+	Transactions      uint64         `json:"transactions"`
+	Revisions         uint64         `json:"revisions"`
+	BytesUploaded     uint64         `json:"bytesUploaded"`
+	ActiveByteDays    uint64         `json:"activeByteDays"`
+	RenterSpending    types.Currency `json:"renterSpending"`
 	HostEarnedRevenue types.Currency `json:"hostEarnedRevenue"`
-	BurntCollateral  types.Currency `json:"burntCollateral"`
-	Tax              types.Currency `json:"tax"`
+	BurntCollateral   types.Currency `json:"burntCollateral"`
+	Tax               types.Currency `json:"tax"`
 
 	// TVL at the end of the period (locked allowance + locked collateral).
 	TVL types.Currency `json:"tvl"`
