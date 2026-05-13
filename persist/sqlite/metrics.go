@@ -62,14 +62,6 @@ func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state met
 		}
 
 		for _, formation := range state.Formations {
-			// Mirror the Apply-side guard: renewal-created formations did
-			// not contribute to BytesUploaded, so we don't subtract on
-			// revert either.
-			var uploaded uint64
-			if !formation.FromRenewal {
-				uploaded = formation.Size
-			}
-
 			gm, err := getMetrics(ctx, tx, state.Timestamp)
 			if err != nil {
 				return fmt.Errorf("failed to get global metrics: %w", err)
@@ -83,7 +75,7 @@ func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state met
 			gm.PotentialRevenue = gm.PotentialRevenue.Sub(formation.HostPotentialRevenue)
 			gm.LockedCollateral = gm.LockedCollateral.Sub(formation.HostLockedCollateral)
 			gm.RiskedCollateral = gm.RiskedCollateral.Sub(formation.HostRiskedCollateral)
-			gm.BytesUploaded -= uploaded
+			gm.BytesUploaded -= formation.BytesUploaded
 
 			hm, err := getHostMetrics(ctx, tx, formation.Host, state.Timestamp)
 			if err != nil {
@@ -92,7 +84,7 @@ func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state met
 			hm.ActiveContracts--
 			hm.ActiveSize -= formation.Size
 			hm.TotalSize -= formation.Size
-			hm.BytesUploaded -= uploaded
+			hm.BytesUploaded -= formation.BytesUploaded
 			hm.LockedCollateral = hm.LockedCollateral.Sub(formation.HostLockedCollateral)
 			hm.RiskedCollateral = hm.RiskedCollateral.Sub(formation.HostRiskedCollateral)
 			hm.PotentialRevenue = hm.PotentialRevenue.Sub(formation.HostPotentialRevenue)
@@ -104,7 +96,7 @@ func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state met
 			rm.ActiveContracts--
 			rm.ActiveSize -= formation.Size
 			rm.TotalSize -= formation.Size
-			rm.BytesUploaded -= uploaded
+			rm.BytesUploaded -= formation.BytesUploaded
 			rm.Locked = rm.Locked.Sub(formation.RenterAllowance)
 			rm.Spent = rm.Spent.Sub(formation.RenterContractPrice)
 			rm.Tax = rm.Tax.Sub(formation.RenterTax)
@@ -119,8 +111,9 @@ func (s *Store) RevertState(ctx context.Context, tip types.ChainIndex, state met
 		}
 
 		for _, revision := range state.Revisions {
-			spent, ok := revision.ExistingAllowance.SubWithUnderflow(revision.NewAllowance)
-			if !ok {
+			// only allowance going down counts as renter spend.
+			spent, underflow := revision.ExistingAllowance.SubWithUnderflow(revision.NewAllowance)
+			if underflow {
 				spent = types.ZeroCurrency
 			}
 			// Mirror the Apply-side guard: only grow revisions contributed
@@ -252,15 +245,9 @@ func (s *Store) ApplyState(ctx context.Context, tip types.ChainIndex, state metr
 	return s.transaction(ctx, func(ctx context.Context, tx *txn) error {
 		for _, formation := range state.Formations {
 			// Renewal-created contracts carry the parent's stored bytes
-			// forward without any new upload. The parent's resolution
-			// already released ActiveSize, and we re-acquire it here, but
-			// BytesUploaded must not double-count those bytes — they were
-			// charged when the parent was formed/grew.
-			var uploaded uint64
-			if !formation.FromRenewal {
-				uploaded = formation.Size
-			}
-
+			// forward without any new upload, except for any off-chain
+			// growth the renewal surfaces (captured in
+			// formation.BytesUploaded — see ContractFormation comment).
 			gm, err := getMetrics(ctx, tx, state.Timestamp)
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return fmt.Errorf("failed to get global metrics: %w", err)
@@ -268,7 +255,7 @@ func (s *Store) ApplyState(ctx context.Context, tip types.ChainIndex, state metr
 			gm.ActiveContracts++
 			gm.ActiveSize += formation.Size
 			gm.TotalSize += formation.Size
-			gm.BytesUploaded += uploaded
+			gm.BytesUploaded += formation.BytesUploaded
 			gm.LockedAllowance = gm.LockedAllowance.Add(formation.RenterAllowance)
 			gm.SpentAllowance = gm.SpentAllowance.Add(formation.RenterContractPrice)
 			gm.Tax = gm.Tax.Add(formation.RenterTax)
@@ -286,7 +273,7 @@ func (s *Store) ApplyState(ctx context.Context, tip types.ChainIndex, state metr
 			hm.ActiveContracts++
 			hm.ActiveSize += formation.Size
 			hm.TotalSize += formation.Size
-			hm.BytesUploaded += uploaded
+			hm.BytesUploaded += formation.BytesUploaded
 			hm.LockedCollateral = hm.LockedCollateral.Add(formation.HostLockedCollateral)
 			hm.RiskedCollateral = hm.RiskedCollateral.Add(formation.HostRiskedCollateral)
 			hm.PotentialRevenue = hm.PotentialRevenue.Add(formation.HostPotentialRevenue)
@@ -306,7 +293,7 @@ func (s *Store) ApplyState(ctx context.Context, tip types.ChainIndex, state metr
 			rm.ActiveContracts++
 			rm.ActiveSize += formation.Size
 			rm.TotalSize += formation.Size
-			rm.BytesUploaded += uploaded
+			rm.BytesUploaded += formation.BytesUploaded
 			rm.Locked = rm.Locked.Add(formation.RenterAllowance)
 			rm.Spent = rm.Spent.Add(formation.RenterContractPrice)
 			rm.Tax = rm.Tax.Add(formation.RenterTax)
@@ -355,8 +342,10 @@ func (s *Store) ApplyState(ctx context.Context, tip types.ChainIndex, state metr
 			if err != nil {
 				return fmt.Errorf("failed to get revision renter metrics for %q: %w", revision.Renter, err)
 			}
-			spent, ok := revision.ExistingAllowance.SubWithUnderflow(revision.NewAllowance)
-			if !ok {
+			// max(0, ExistingAllowance - NewAllowance): only allowance going
+			// down counts as renter spend.
+			spent, underflow := revision.ExistingAllowance.SubWithUnderflow(revision.NewAllowance)
+			if underflow {
 				spent = types.ZeroCurrency
 			}
 			rm.ActiveSize = rm.ActiveSize - revision.ExistingSize + revision.NewSize
@@ -757,14 +746,14 @@ ON CONFLICT(host_key, date_created) DO UPDATE SET
 	first_seen = excluded.first_seen,
 	last_active = excluded.last_active;`,
 		sqlHash256(m.PublicKey),
-		m.ActiveContracts,
-		m.RenewedContracts,
-		m.SuccessfulContracts,
-		m.FailedContracts,
-		m.RevisionCount,
-		m.ActiveSize,
-		m.TotalSize,
-		m.BytesUploaded,
+		sqlUint64(m.ActiveContracts),
+		sqlUint64(m.RenewedContracts),
+		sqlUint64(m.SuccessfulContracts),
+		sqlUint64(m.FailedContracts),
+		sqlUint64(m.RevisionCount),
+		sqlUint64(m.ActiveSize),
+		sqlUint64(m.TotalSize),
+		sqlUint64(m.BytesUploaded),
 		sqlCurrency(m.BurntCollateral),
 		sqlCurrency(m.LockedCollateral),
 		sqlCurrency(m.RiskedCollateral),
@@ -794,14 +783,14 @@ ON CONFLICT(renter_key, date_created) DO UPDATE SET
 	first_seen = excluded.first_seen,
 	last_active = excluded.last_active;`,
 		sqlHash256(m.PublicKey),
-		m.ActiveContracts,
-		m.RenewedContracts,
-		m.SuccessfulContracts,
-		m.FailedContracts,
-		m.RevisionCount,
-		m.ActiveSize,
-		m.TotalSize,
-		m.BytesUploaded,
+		sqlUint64(m.ActiveContracts),
+		sqlUint64(m.RenewedContracts),
+		sqlUint64(m.SuccessfulContracts),
+		sqlUint64(m.FailedContracts),
+		sqlUint64(m.RevisionCount),
+		sqlUint64(m.ActiveSize),
+		sqlUint64(m.TotalSize),
+		sqlUint64(m.BytesUploaded),
 		sqlCurrency(m.Locked),
 		sqlCurrency(m.Spent),
 		sqlCurrency(m.Tax),
@@ -837,18 +826,18 @@ ON CONFLICT(date_created) DO UPDATE SET
 	locked_collateral = excluded.locked_collateral,
 	risked_collateral = excluded.risked_collateral,
 	burnt_collateral = excluded.burnt_collateral;`,
-		m.Renters,
-		m.Hosts,
-		m.ActiveContracts,
-		m.RenewedContracts,
-		m.SuccessfulContracts,
-		m.FailedContracts,
-		m.TransactionCount,
-		m.RevisionCount,
-		m.ActiveSize,
-		m.TotalSize,
-		m.BytesUploaded,
-		m.ActiveByteDays,
+		sqlUint64(m.Renters),
+		sqlUint64(m.Hosts),
+		sqlUint64(m.ActiveContracts),
+		sqlUint64(m.RenewedContracts),
+		sqlUint64(m.SuccessfulContracts),
+		sqlUint64(m.FailedContracts),
+		sqlUint64(m.TransactionCount),
+		sqlUint64(m.RevisionCount),
+		sqlUint64(m.ActiveSize),
+		sqlUint64(m.TotalSize),
+		sqlUint64(m.BytesUploaded),
+		sqlUint64(m.ActiveByteDays),
 		sqlCurrency(m.SpentAllowance),
 		sqlCurrency(m.LockedAllowance),
 		sqlCurrency(m.Tax),
@@ -863,18 +852,18 @@ ON CONFLICT(date_created) DO UPDATE SET
 
 func scanMetrics(s scanner) (m metrics.Metrics, err error) {
 	err = s.Scan(
-		&m.Renters,
-		&m.Hosts,
-		&m.ActiveContracts,
-		&m.RenewedContracts,
-		&m.SuccessfulContracts,
-		&m.FailedContracts,
-		&m.TransactionCount,
-		&m.RevisionCount,
-		&m.ActiveSize,
-		&m.TotalSize,
-		&m.BytesUploaded,
-		&m.ActiveByteDays,
+		(*sqlUint64)(&m.Renters),
+		(*sqlUint64)(&m.Hosts),
+		(*sqlUint64)(&m.ActiveContracts),
+		(*sqlUint64)(&m.RenewedContracts),
+		(*sqlUint64)(&m.SuccessfulContracts),
+		(*sqlUint64)(&m.FailedContracts),
+		(*sqlUint64)(&m.TransactionCount),
+		(*sqlUint64)(&m.RevisionCount),
+		(*sqlUint64)(&m.ActiveSize),
+		(*sqlUint64)(&m.TotalSize),
+		(*sqlUint64)(&m.BytesUploaded),
+		(*sqlUint64)(&m.ActiveByteDays),
 		(*sqlCurrency)(&m.SpentAllowance),
 		(*sqlCurrency)(&m.LockedAllowance),
 		(*sqlCurrency)(&m.Tax),
@@ -891,14 +880,14 @@ func scanMetrics(s scanner) (m metrics.Metrics, err error) {
 func scanRenter(s scanner) (r metrics.Renter, err error) {
 	err = s.Scan(
 		(*sqlHash256)(&r.PublicKey),
-		&r.ActiveContracts,
-		&r.RenewedContracts,
-		&r.SuccessfulContracts,
-		&r.FailedContracts,
-		&r.RevisionCount,
-		&r.ActiveSize,
-		&r.TotalSize,
-		&r.BytesUploaded,
+		(*sqlUint64)(&r.ActiveContracts),
+		(*sqlUint64)(&r.RenewedContracts),
+		(*sqlUint64)(&r.SuccessfulContracts),
+		(*sqlUint64)(&r.FailedContracts),
+		(*sqlUint64)(&r.RevisionCount),
+		(*sqlUint64)(&r.ActiveSize),
+		(*sqlUint64)(&r.TotalSize),
+		(*sqlUint64)(&r.BytesUploaded),
 		(*sqlCurrency)(&r.Locked),
 		(*sqlCurrency)(&r.Spent),
 		(*sqlCurrency)(&r.Tax),
@@ -912,14 +901,14 @@ func scanRenter(s scanner) (r metrics.Renter, err error) {
 func scanHost(s scanner) (h metrics.Host, err error) {
 	err = s.Scan(
 		(*sqlHash256)(&h.PublicKey),
-		&h.ActiveContracts,
-		&h.RenewedContracts,
-		&h.SuccessfulContracts,
-		&h.FailedContracts,
-		&h.RevisionCount,
-		&h.ActiveSize,
-		&h.TotalSize,
-		&h.BytesUploaded,
+		(*sqlUint64)(&h.ActiveContracts),
+		(*sqlUint64)(&h.RenewedContracts),
+		(*sqlUint64)(&h.SuccessfulContracts),
+		(*sqlUint64)(&h.FailedContracts),
+		(*sqlUint64)(&h.RevisionCount),
+		(*sqlUint64)(&h.ActiveSize),
+		(*sqlUint64)(&h.TotalSize),
+		(*sqlUint64)(&h.BytesUploaded),
 		(*sqlCurrency)(&h.BurntCollateral),
 		(*sqlCurrency)(&h.LockedCollateral),
 		(*sqlCurrency)(&h.RiskedCollateral),

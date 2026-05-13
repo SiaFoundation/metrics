@@ -40,6 +40,24 @@ func (h *sqlHash256) Scan(src any) error {
 	return errors.New("invalid type")
 }
 
+// sqlUint64 stores a uint64 as 8 bytes big-endian. The Go SQLite driver
+// rejects uint64 values with the high bit set when binding as INTEGER.
+type sqlUint64 uint64
+
+func (u sqlUint64) Value() (driver.Value, error) {
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, uint64(u))
+	return b, nil
+}
+
+func (u *sqlUint64) Scan(src any) error {
+	if b, ok := src.([]byte); ok && len(b) == 8 {
+		*u = sqlUint64(binary.BigEndian.Uint64(b))
+		return nil
+	}
+	return errors.New("invalid type")
+}
+
 type sqlCurrency types.Currency
 
 func (c sqlCurrency) Value() (driver.Value, error) {

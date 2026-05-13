@@ -163,12 +163,16 @@ type (
 		Host   types.PublicKey
 		Renter types.PublicKey
 		Size   uint64
-		// FromRenewal is true when this contract was created as the result
-		// of a V2FileContractRenewal of an existing contract. The new
-		// contract carries the parent's stored bytes forward without any
-		// new upload, so the formation does not contribute to BytesUploaded
-		// (those bytes were counted when the parent was formed/grew).
-		FromRenewal bool
+		// BytesUploaded is the amount this formation event contributes to
+		// the host's, renter's, and global BytesUploaded counters. For a
+		// fresh formation this is the contract's initial Filesize. For a
+		// renewal-created formation it is max(0, newFC.Filesize −
+		// parent.Filesize) — i.e., only the growth that the renewal makes
+		// visible (off-chain uploads on the parent that surface here). The
+		// parent's prior Filesize was already credited when the parent was
+		// formed (or grew via on-chain revision); double-counting it here
+		// would inflate BytesUploaded with every renewal.
+		BytesUploaded uint64
 
 		// RenterAllowance is the refundable allowance locked into the
 		// contract at formation (= RenterOutput.Value).
@@ -315,22 +319,12 @@ var (
 	ErrNotFound = fmt.Errorf("not found")
 )
 
-// wellFormedV2Contract reports whether a v2 file contract fits the standard
-// payout decomposition assumed by the metrics: MissedHostValue ≤ TotalCollateral
-// ≤ HostOutput.Value. Consensus enforces the second inequality only at
-// formation (not on revisions) and never enforces the first, so a hand-crafted
-// or non-standard contract — or a contract revised in a way that redistributes
-// value from HostOutput.Value to RenterOutput.Value — can validly violate
-// either. The metric model relies on both inequalities to avoid Currency.Sub
-// underflows in:
-//   - fc.RiskedCollateral()       = TotalCollateral − MissedHostValue
-//   - fc.RiskedHostRevenue()      = HostOutput.Value − TotalCollateral
-//   - HostOutput.Value − MissedHostValue (used as HostBurn at expiration)
-//
-// Contracts that fail either inequality are skipped for metric purposes.
-func wellFormedV2Contract(fc types.V2FileContract) bool {
-	return fc.MissedHostValue.Cmp(fc.TotalCollateral) <= 0 &&
-		fc.TotalCollateral.Cmp(fc.HostOutput.Value) <= 0
+func subOrZero(a, b types.Currency) types.Currency {
+	v, underflow := a.SubWithUnderflow(b)
+	if underflow {
+		return types.ZeroCurrency
+	}
+	return v
 }
 
 func minCurrency(a, b types.Currency) types.Currency {
@@ -365,16 +359,14 @@ func renewalCarriesRevenue(parent, renewal types.V2FileContract) bool {
 // per-side conservation convention (core/rhp/v4: RenewContract,
 // RefreshContractPartialRollover, RefreshContractFullRollover all preserve
 // per-side balance even though consensus only enforces the four-way sum).
-//
-// Preconditions (caller's responsibility): parent and renewal.NewContract are
-// well-formed, and the latest off-chain RiskedHostRevenue is ≥ the on-chain
-// parent's — i.e. the renewal was produced by rhp4 and reflects a valid
-// non-regressing v2 lineage. Violations are filtered upstream in parseDiffs
-// as abandoned resolutions.
 func renewalRevenue(parent types.V2FileContract, renewal *types.V2FileContractRenewal) (newRevenue, earnedRevenue types.Currency) {
+	// subOrZero guards against non-standard renewals on a parent (or with a
+	// new contract) where TC > HostOutput.Value — consensus permits this on
+	// revisions but rhp4 doesn't produce it. Clamping keeps every contract
+	// tracked through its lifecycle.
 	finalHostValue := renewal.FinalHostOutput.Value.Add(renewal.HostRollover)
-	finalPotentialRevenue := finalHostValue.Sub(parent.TotalCollateral)
-	newPotentialRevenue := renewal.NewContract.RiskedHostRevenue()
+	finalPotentialRevenue := subOrZero(finalHostValue, parent.TotalCollateral)
+	newPotentialRevenue := subOrZero(renewal.NewContract.HostOutput.Value, renewal.NewContract.TotalCollateral)
 
 	// Duration-extending renewal (RenewContract): HostRollover = min(parent.TC,
 	// new.TC) ≤ parent.TC, so no revenue rolls forward — the full latest
@@ -403,6 +395,23 @@ func parseDiffs(timestamp time.Time, cs consensus.State, txns []types.V2Transact
 	state := State{
 		Timestamp: timestamp.Truncate(time.Hour),
 	}
+	// mid mirrors consensus's MidState: when multiple revisions of the same
+	// contract appear in a single block (or a contract is revised and then
+	// resolved in the same block, or a renewal-created contract is revised
+	// later in the same block), each raw V2FileContractRevision/Resolution
+	// carries the *pre-block* Parent.V2FileContract — consensus's
+	// validateRevision chains them against its own midstate
+	// (core/consensus/validation.go:733-738). Without doing the same chaining
+	// here, the Nth event's "existing" values would equal the (N-1)th event's,
+	// and the active-state counters would double-debit the parent's prior
+	// value.
+	mid := make(map[types.FileContractID]types.V2FileContract)
+	currentParent := func(id types.FileContractID, fallback types.V2FileContract) types.V2FileContract {
+		if fc, ok := mid[id]; ok {
+			return fc
+		}
+		return fallback
+	}
 	for _, txn := range txns {
 		txnID := txn.ID()
 
@@ -410,66 +419,43 @@ func parseDiffs(timestamp time.Time, cs consensus.State, txns []types.V2Transact
 		// from scratch in this transaction; renewal-created contracts come
 		// through txn.FileContractResolutions below.
 		for i, fc := range txn.FileContracts {
-			log := log.With(zap.Stringer("id", txn.V2FileContractID(txnID, i)))
-			// Skip contracts that don't fit the standard payout decomposition.
-			// Consensus allows MissedHostValue > TotalCollateral, but the metric
-			// model can't attribute such a contract's payouts to collateral vs.
-			// revenue, and fc.RiskedCollateral() would underflow.
-			if !wellFormedV2Contract(fc) {
-				log.Warn("skipping malformed v2 contract", zap.Stringer("missedHostValue", fc.MissedHostValue), zap.Stringer("totalCollateral", fc.TotalCollateral), zap.Stringer("hostOutput", fc.HostOutput.Value))
-				continue
-			}
-			renterContractPrice := fc.HostOutput.Value.Sub(fc.TotalCollateral)
+			id := txn.V2FileContractID(txnID, i)
+			log := log.With(zap.Stringer("id", id))
+			riskedCollateral := subOrZero(fc.TotalCollateral, fc.MissedHostValue)
+			riskedHostRevenue := subOrZero(fc.HostOutput.Value, fc.TotalCollateral)
 			renterTax := cs.V2FileContractTax(fc)
 			state.Formations = append(state.Formations, ContractFormation{
-				Host:        fc.HostPublicKey,
-				Renter:      fc.RenterPublicKey,
-				Size:        fc.Filesize,
-				FromRenewal: false,
+				Host:          fc.HostPublicKey,
+				Renter:        fc.RenterPublicKey,
+				Size:          fc.Filesize,
+				BytesUploaded: fc.Filesize,
 
 				RenterAllowance:     fc.RemainingAllowance(),
-				RenterContractPrice: renterContractPrice,
+				RenterContractPrice: riskedHostRevenue,
 				RenterTax:           renterTax,
 
 				HostLockedCollateral: fc.TotalCollateral,
-				HostRiskedCollateral: fc.RiskedCollateral(),
-				HostPotentialRevenue: fc.RiskedHostRevenue(),
+				HostRiskedCollateral: riskedCollateral,
+				HostPotentialRevenue: riskedHostRevenue,
 			})
-			log.Debug("contract formation", zap.Stringer("host", fc.HostPublicKey), zap.Stringer("renter", fc.RenterPublicKey), zap.Stringer("allowance", fc.RemainingAllowance()), zap.Stringer("contractPrice", renterContractPrice), zap.Stringer("tax", renterTax), zap.Stringer("collateral", fc.RiskedCollateral()), zap.Stringer("revenue", fc.RiskedHostRevenue()))
+			mid[id] = fc
+			log.Debug("contract formation", zap.Stringer("host", fc.HostPublicKey), zap.Stringer("renter", fc.RenterPublicKey), zap.Stringer("allowance", fc.RemainingAllowance()), zap.Stringer("contractPrice", riskedHostRevenue), zap.Stringer("tax", renterTax), zap.Stringer("collateral", riskedCollateral), zap.Stringer("revenue", riskedHostRevenue))
 		}
 
-		// On-chain revisions.
+		// On-chain revisions. Every revision is tracked, even ones whose
+		// resulting state isn't well-formed in the strict
+		// MissedHostValue ≤ TotalCollateral ≤ HostOutput.Value sense;
+		// subOrZero clamps the derived values to zero in that case.
+		// Skipping malformed states would strand the contract: a later
+		// revision could bring it back to a well-formed state and the next
+		// event would underflow the active counters.
 		for _, rev := range txn.FileContractRevisions {
 			log := log.With(zap.Stringer("id", rev.Parent.ID))
-			fc := rev.Parent.V2FileContract
-			if !wellFormedV2Contract(fc) {
-				log.Warn("skipping malformed v2 contract", zap.Stringer("missedHostValue", fc.MissedHostValue), zap.Stringer("totalCollateral", fc.TotalCollateral), zap.Stringer("hostOutput", fc.HostOutput.Value))
-				continue
-			}
-			// A revision can redistribute HostOutput.Value into
-			// RenterOutput.Value (preserving the sum), which consensus does
-			// not check against TotalCollateral. If the revision lands in a
-			// state where TotalCollateral > HostOutput.Value,
-			// rev.RiskedHostRevenue() would underflow. We can't safely record
-			// the revision and won't be able to safely process any subsequent
-			// events for this contract either. Synthesize an abandonment
-			// resolution so the contract stops being counted as active.
-			// HostBurn and HostEarnedRevenue stay zero because no actual chain
-			// settlement occurred.
-			if !wellFormedV2Contract(rev.Revision) {
-				log.Warn("abandoning v2 contract after malformed revision", zap.Stringer("missedHostValue", rev.Revision.MissedHostValue), zap.Stringer("totalCollateral", rev.Revision.TotalCollateral), zap.Stringer("hostOutput", rev.Revision.HostOutput.Value))
-				state.Resolutions = append(state.Resolutions, ContractResolution{
-					Host:                 fc.HostPublicKey,
-					Renter:               fc.RenterPublicKey,
-					Size:                 fc.Filesize,
-					Type:                 ResolutionTypeAbandoned,
-					RenterAllowance:      fc.RemainingAllowance(),
-					HostLockedCollateral: fc.TotalCollateral,
-					HostRiskedCollateral: fc.RiskedCollateral(),
-					HostPotentialRevenue: fc.RiskedHostRevenue(),
-				})
-				continue
-			}
+			fc := currentParent(rev.Parent.ID, rev.Parent.V2FileContract)
+			existingRiskedCollateral := subOrZero(fc.TotalCollateral, fc.MissedHostValue)
+			newRiskedCollateral := subOrZero(rev.Revision.TotalCollateral, rev.Revision.MissedHostValue)
+			existingPotentialRevenue := subOrZero(fc.HostOutput.Value, fc.TotalCollateral)
+			newPotentialRevenue := subOrZero(rev.Revision.HostOutput.Value, rev.Revision.TotalCollateral)
 			state.Revisions = append(state.Revisions, ContractRevision{
 				Host:   fc.HostPublicKey,
 				Renter: fc.RenterPublicKey,
@@ -480,13 +466,14 @@ func parseDiffs(timestamp time.Time, cs consensus.State, txns []types.V2Transact
 				ExistingAllowance: fc.RemainingAllowance(),
 				NewAllowance:      rev.Revision.RemainingAllowance(),
 
-				ExistingRiskedCollateral: fc.RiskedCollateral(),
-				NewRiskedCollateral:      rev.Revision.RiskedCollateral(),
+				ExistingRiskedCollateral: existingRiskedCollateral,
+				NewRiskedCollateral:      newRiskedCollateral,
 
-				ExistingPotentialRevenue: fc.RiskedHostRevenue(),
-				NewPotentialRevenue:      rev.Revision.RiskedHostRevenue(),
+				ExistingPotentialRevenue: existingPotentialRevenue,
+				NewPotentialRevenue:      newPotentialRevenue,
 			})
-			log.Debug("contract revision", zap.Uint64("revisionNumber", rev.Revision.RevisionNumber), zap.Stringer("allowance", rev.Revision.RemainingAllowance()), zap.Stringer("existingRisked", fc.RiskedCollateral()), zap.Stringer("newRisked", rev.Revision.RiskedCollateral()), zap.Stringer("revenue", rev.Revision.RiskedHostRevenue()), zap.Stringer("host", fc.HostPublicKey), zap.Stringer("renter", fc.RenterPublicKey))
+			mid[rev.Parent.ID] = rev.Revision
+			log.Debug("contract revision", zap.Uint64("revisionNumber", rev.Revision.RevisionNumber), zap.Stringer("allowance", rev.Revision.RemainingAllowance()), zap.Stringer("existingRisked", existingRiskedCollateral), zap.Stringer("newRisked", newRiskedCollateral), zap.Stringer("revenue", newPotentialRevenue), zap.Stringer("host", fc.HostPublicKey), zap.Stringer("renter", fc.RenterPublicKey))
 		}
 
 		// Resolutions. Renewals also emit the new contract's formation here,
@@ -494,11 +481,8 @@ func parseDiffs(timestamp time.Time, cs consensus.State, txns []types.V2Transact
 		// cross-reference lookup.
 		for _, fcr := range txn.FileContractResolutions {
 			log := log.With(zap.Stringer("id", fcr.Parent.ID))
-			fc := fcr.Parent.V2FileContract
-			if !wellFormedV2Contract(fc) {
-				log.Warn("skipping malformed v2 contract", zap.Stringer("missedHostValue", fc.MissedHostValue), zap.Stringer("totalCollateral", fc.TotalCollateral), zap.Stringer("hostOutput", fc.HostOutput.Value))
-				continue
-			}
+			fc := currentParent(fcr.Parent.ID, fcr.Parent.V2FileContract)
+			parentRiskedHostRevenue := subOrZero(fc.HostOutput.Value, fc.TotalCollateral)
 			cr := ContractResolution{
 				Host:   fc.HostPublicKey,
 				Renter: fc.RenterPublicKey,
@@ -507,45 +491,18 @@ func parseDiffs(timestamp time.Time, cs consensus.State, txns []types.V2Transact
 				RenterAllowance: fc.RemainingAllowance(),
 
 				HostLockedCollateral: fc.TotalCollateral,
-				HostRiskedCollateral: fc.RiskedCollateral(),
-				HostPotentialRevenue: fc.RiskedHostRevenue(),
+				HostRiskedCollateral: subOrZero(fc.TotalCollateral, fc.MissedHostValue),
+				HostPotentialRevenue: parentRiskedHostRevenue,
 			}
 
 			switch res := fcr.Resolution.(type) {
 			case *types.V2FileContractExpiration:
 				cr.Type = ResolutionTypeExpired
-				cr.HostBurn = fc.HostOutput.Value.Sub(fc.MissedHostValue)
+				cr.HostBurn = subOrZero(fc.HostOutput.Value, fc.MissedHostValue)
 			case *types.V2StorageProof:
 				cr.Type = ResolutionTypeProof
-				cr.HostEarnedRevenue = fc.RiskedHostRevenue()
+				cr.HostEarnedRevenue = parentRiskedHostRevenue
 			case *types.V2FileContractRenewal:
-				// Consensus runs validateContract on the renewal's new
-				// contract (enforcing TotalCollateral ≤ HostOutput.Value)
-				// but does not enforce MissedHostValue ≤ TotalCollateral,
-				// so the new contract can still fail wellFormedV2Contract.
-				// Classify as abandonment so we don't credit RenewedContracts
-				// for a renewal whose successor we can't account for; the
-				// active-counter release for the old contract still applies.
-				if !wellFormedV2Contract(res.NewContract) {
-					log.Warn("abandoning v2 contract: renewal produced malformed new contract", zap.Stringer("missedHostValue", res.NewContract.MissedHostValue), zap.Stringer("totalCollateral", res.NewContract.TotalCollateral), zap.Stringer("hostOutput", res.NewContract.HostOutput.Value))
-					cr.Type = ResolutionTypeAbandoned
-					break
-				}
-				// rhp4 v2 revisions only ever move value from renter side to
-				// host side; the host never refunds. So the latest off-chain
-				// host value (reconstructable from the resolution via per-side
-				// conservation: FinalHostOutput.Value + HostRollover) must be
-				// at least the on-chain parent's HostOutput.Value, and the
-				// latest RiskedHostRevenue must be at least the parent's. A
-				// violation means the renewal wasn't produced by rhp4 — abandon
-				// so we don't credit the lineage with values we can't trust.
-				finalHostValue := res.FinalHostOutput.Value.Add(res.HostRollover)
-				latestPotentialRevenue, underflow := finalHostValue.SubWithUnderflow(fc.TotalCollateral)
-				if underflow || latestPotentialRevenue.Cmp(fc.RiskedHostRevenue()) < 0 {
-					log.Warn("abandoning v2 contract: renewal latest off-chain state regresses from on-chain parent", zap.Stringer("finalHostValue", finalHostValue), zap.Stringer("parentTotalCollateral", fc.TotalCollateral), zap.Stringer("parentRiskedHostRevenue", fc.RiskedHostRevenue()))
-					cr.Type = ResolutionTypeAbandoned
-					break
-				}
 				cr.Type = ResolutionTypeRenewed
 				// Refreshes carry old host revenue forward into the renewal
 				// contract; duration-extending renewals settle the old term.
@@ -553,36 +510,50 @@ func parseDiffs(timestamp time.Time, cs consensus.State, txns []types.V2Transact
 				// earned here.
 				newRevenue, earnedRevenue := renewalRevenue(fc, res)
 				cr.HostEarnedRevenue = earnedRevenue
-				// The renter's off-chain spend on the parent (since its last
-				// on-chain state) surfaces here as the gap between latest
-				// off-chain RiskedHostRevenue and on-chain. Credit it to
-				// Spent so renter cumulative spending tracks host
-				// EarnedRevenue across renewal lineages. Guaranteed
-				// non-negative by the validation above.
-				cr.RenterDeferredSpend = latestPotentialRevenue.Sub(fc.RiskedHostRevenue())
+				// The renter's off-chain spend on the parent surfaces here
+				// as the gap between latest off-chain RiskedHostRevenue and
+				// the on-chain parent. subOrZero handles two consensus-
+				// permitted edge cases: (1) a parent whose TC > HostOutput.Value
+				// (post-revision redistribution), where the first subtraction
+				// would otherwise underflow, and (2) a renewal whose per-side
+				// values regress from on-chain (rhp4 doesn't produce this).
+				finalHostValue := res.FinalHostOutput.Value.Add(res.HostRollover)
+				latestPotentialRevenue := subOrZero(finalHostValue, fc.TotalCollateral)
+				cr.RenterDeferredSpend = subOrZero(latestPotentialRevenue, parentRiskedHostRevenue)
 
 				// Emit the renewal-created formation alongside the resolution.
-				// FromRenewal=true tells the sqlite layer not to count the
-				// new contract's filesize as freshly uploaded bytes (they
-				// were charged when the parent was originally formed/grew).
+				// BytesUploaded credits only the off-chain growth surfaced
+				// here: newFC.Filesize is the latest off-chain size (per
+				// rhp4 NewContract.Filesize = fc.Filesize at construction),
+				// while the parent's on-chain Filesize may be stale (no
+				// broadcast revision). The delta is real upload activity
+				// that's never been counted; without crediting it here,
+				// BytesUploaded drifts below ActiveSize over renewals.
 				newFC := res.NewContract
 				newID := fcr.Parent.ID.V2RenewalID()
+				mid[newID] = newFC
+				newRiskedCollateral := subOrZero(newFC.TotalCollateral, newFC.MissedHostValue)
+				newRiskedHostRevenue := subOrZero(newFC.HostOutput.Value, newFC.TotalCollateral)
+				var renewalBytesUploaded uint64
+				if newFC.Filesize > fc.Filesize {
+					renewalBytesUploaded = newFC.Filesize - fc.Filesize
+				}
 				renewalLog := log.With(zap.Stringer("renewalID", newID), zap.Uint64("renewalProofHeight", newFC.ProofHeight))
 				state.Formations = append(state.Formations, ContractFormation{
-					Host:        newFC.HostPublicKey,
-					Renter:      newFC.RenterPublicKey,
-					Size:        newFC.Filesize,
-					FromRenewal: true,
+					Host:          newFC.HostPublicKey,
+					Renter:        newFC.RenterPublicKey,
+					Size:          newFC.Filesize,
+					BytesUploaded: renewalBytesUploaded,
 
 					RenterAllowance:     newFC.RemainingAllowance(),
 					RenterContractPrice: newRevenue,
 					RenterTax:           cs.V2FileContractTax(newFC),
 
 					HostLockedCollateral: newFC.TotalCollateral,
-					HostRiskedCollateral: newFC.RiskedCollateral(),
-					HostPotentialRevenue: newFC.RiskedHostRevenue(),
+					HostRiskedCollateral: newRiskedCollateral,
+					HostPotentialRevenue: newRiskedHostRevenue,
 				})
-				renewalLog.Debug("renewal-created formation", zap.Stringer("host", newFC.HostPublicKey), zap.Stringer("renter", newFC.RenterPublicKey), zap.Stringer("allowance", newFC.RemainingAllowance()), zap.Stringer("contractPrice", newRevenue), zap.Stringer("collateral", newFC.RiskedCollateral()), zap.Stringer("revenue", newFC.RiskedHostRevenue()))
+				renewalLog.Debug("renewal-created formation", zap.Stringer("host", newFC.HostPublicKey), zap.Stringer("renter", newFC.RenterPublicKey), zap.Stringer("allowance", newFC.RemainingAllowance()), zap.Stringer("contractPrice", newRevenue), zap.Stringer("collateral", newRiskedCollateral), zap.Stringer("revenue", newRiskedHostRevenue), zap.Uint64("bytesUploaded", renewalBytesUploaded))
 			default:
 				panic(fmt.Sprintf("unknown resolution type: %T", fcr.Resolution)) // should never happen
 			}

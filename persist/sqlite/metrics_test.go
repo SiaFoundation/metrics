@@ -41,6 +41,7 @@ func TestApplyRevertRefreshRevenueAccounting(t *testing.T) {
 			Host:                 hostKey,
 			Renter:               renterKey,
 			Size:                 64,
+			BytesUploaded:        64,
 			RenterAllowance:      testCurrency(50),
 			RenterContractPrice:  testCurrency(30),
 			HostLockedCollateral: testCurrency(100),
@@ -150,6 +151,7 @@ func TestActiveSizeAndBytesUploadedAcrossLifecycle(t *testing.T) {
 			Host:                 hostKey,
 			Renter:               renterKey,
 			Size:                 size,
+			BytesUploaded:        size, // fresh formation credits full Filesize
 			RenterAllowance:      testCurrency(50),
 			RenterContractPrice:  testCurrency(30),
 			HostLockedCollateral: testCurrency(100),
@@ -170,7 +172,7 @@ func TestActiveSizeAndBytesUploadedAcrossLifecycle(t *testing.T) {
 			Host:                 hostKey,
 			Renter:               renterKey,
 			Size:                 size,
-			FromRenewal:          true,
+			BytesUploaded:        0, // renewal-created with no growth
 			RenterAllowance:      testCurrency(100),
 			RenterContractPrice:  testCurrency(7),
 			HostLockedCollateral: testCurrency(240),

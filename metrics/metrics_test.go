@@ -235,51 +235,70 @@ func TestParseDiffsTermRenewalSettlesOldRevenue(t *testing.T) {
 	assertCurrency(t, "renewal deferred spend", state.Resolutions[0].RenterDeferredSpend, testCurrency(23))
 }
 
-func TestParseDiffsRenewalMarksFormationFromRenewal(t *testing.T) {
-	// A renewal-created formation must carry FromRenewal=true so the SQLite
-	// layer knows not to count its filesize as new bytes uploaded. A fresh
-	// formation (no renewal context) must leave the flag unset.
-	parent := staleParent()
-	newContract := testFileContract(100, 110, 64, testCurrency(50), testCurrency(120), testCurrency(80), testCurrency(37))
-	renewal := &types.V2FileContractRenewal{
+func TestParseDiffsFormationBytesUploaded(t *testing.T) {
+	// A fresh formation credits its full Filesize to BytesUploaded. A
+	// renewal-created formation credits only the off-chain growth surfaced
+	// at the renewal (newFC.Filesize − parent.Filesize); the parent's
+	// pre-renewal Filesize was already credited when the parent was formed.
+	// Same-size renewal: BytesUploaded=0. Grew-since-on-chain renewal:
+	// BytesUploaded = the growth.
+	parent := staleParent() // filesize=64
+	noGrowthNewContract := testFileContract(100, 110, 64, testCurrency(50), testCurrency(120), testCurrency(80), testCurrency(37))
+	noGrowthRenewal := &types.V2FileContractRenewal{
 		FinalRenterOutput: types.SiacoinOutput{Value: types.ZeroCurrency},
 		FinalHostOutput:   types.SiacoinOutput{Value: types.ZeroCurrency},
 		RenterRollover:    testCurrency(57),
 		HostRollover:      testCurrency(130),
-		NewContract:       newContract,
+		NewContract:       noGrowthNewContract,
 	}
-	assertRenewalSumConserved(t, parent, renewal)
+	assertRenewalSumConserved(t, parent, noGrowthRenewal)
+
+	grewNewContract := testFileContract(100, 110, 200, testCurrency(50), testCurrency(120), testCurrency(80), testCurrency(37))
+	grewRenewal := &types.V2FileContractRenewal{
+		FinalRenterOutput: types.SiacoinOutput{Value: types.ZeroCurrency},
+		FinalHostOutput:   types.SiacoinOutput{Value: types.ZeroCurrency},
+		RenterRollover:    testCurrency(57),
+		HostRollover:      testCurrency(130),
+		NewContract:       grewNewContract,
+	}
+	assertRenewalSumConserved(t, parent, grewRenewal)
 
 	freshFC := testFileContract(100, 110, 64, testCurrency(100), testCurrency(200), testCurrency(200), testCurrency(7))
 
-	// Two transactions in block order: the renewal first, then the fresh
-	// formation. The renewal-created formation is appended at resolution
-	// processing time, so state.Formations[0] is the renewal-created one.
 	state := testParseDiffs(t, []types.V2Transaction{
-		renewalTxn(testContractID(7), parent, renewal),
+		renewalTxn(testContractID(7), parent, noGrowthRenewal),
+		renewalTxn(testContractID(8), parent, grewRenewal),
 		{FileContracts: []types.V2FileContract{freshFC}},
 	})
 
-	if len(state.Formations) != 2 {
-		t.Fatalf("expected two formations, got %d", len(state.Formations))
+	if len(state.Formations) != 3 {
+		t.Fatalf("expected three formations, got %d", len(state.Formations))
 	}
-	if !state.Formations[0].FromRenewal {
-		t.Fatalf("renewal-created formation: expected FromRenewal=true")
+	if got := state.Formations[0].BytesUploaded; got != 0 {
+		t.Fatalf("renewal-created formation (no growth): expected BytesUploaded=0, got %d", got)
 	}
-	if state.Formations[1].FromRenewal {
-		t.Fatalf("fresh formation: expected FromRenewal=false")
+	// parent.Filesize=64, newFC.Filesize=200 → growth = 136.
+	if got := state.Formations[1].BytesUploaded; got != 136 {
+		t.Fatalf("renewal-created formation (grew): expected BytesUploaded=136, got %d", got)
+	}
+	if got := state.Formations[2].BytesUploaded; got != 64 {
+		t.Fatalf("fresh formation: expected BytesUploaded=64 (full Filesize), got %d", got)
 	}
 }
 
-func TestParseDiffsAbandonsRenewalWithRegressedRevenue(t *testing.T) {
-	// rhp4 v2 revisions only ever move value from renter side to host side; the
+func TestParseDiffsRenewalWithRegressedRevenueClampsDeferred(t *testing.T) {
+	// rhp4 v2 renewals only ever move value from renter side to host side; the
 	// host never refunds. If a renewal's reconstructed latest off-chain
 	// RiskedHostRevenue is below the on-chain parent's, the renewal wasn't
-	// produced by rhp4 and the lineage can't be trusted — parseDiffs abandons.
+	// produced by rhp4 — but the new contract is still real on chain and the
+	// metric model must continue to track it, or follow-up revisions will
+	// underflow active-state counters. We process the renewal normally and
+	// clamp RenterDeferredSpend to zero (the "off-chain accrual" doesn't
+	// exist in this case — the contract appears to have lost host value).
 	//
-	// Fixture: on-chain parent has revenue=30 (formation captured everything).
-	// Renewal's resolution implies latest=10 (host gave 20 SC back somehow).
-	// Parent sum is 50 + 130 = 180; renewal sum is 0 + (10+100) + 50 + 20 = 180.
+	// Fixture: on-chain parent has revenue=30. Renewal's resolution implies
+	// latest=10 (host gave 20 SC back somehow). Parent sum is 50 + 130 = 180;
+	// renewal sum is 0 + (10+100) + 50 + 20 = 180.
 	parent := testFileContract(100, 110, 64, testCurrency(50), testCurrency(100), testCurrency(60), testCurrency(30))
 	newContract := testFileContract(100, 110, 64, testCurrency(50), testCurrency(120), testCurrency(80), testCurrency(15))
 	renewal := &types.V2FileContractRenewal{
@@ -296,15 +315,14 @@ func TestParseDiffsAbandonsRenewalWithRegressedRevenue(t *testing.T) {
 	if len(state.Resolutions) != 1 {
 		t.Fatalf("expected one resolution, got %d", len(state.Resolutions))
 	}
-	if state.Resolutions[0].Type != ResolutionTypeAbandoned {
-		t.Fatalf("resolution type: got %d, want %d (abandoned)", state.Resolutions[0].Type, ResolutionTypeAbandoned)
+	if state.Resolutions[0].Type != ResolutionTypeRenewed {
+		t.Fatalf("resolution type: got %d, want %d (renewed)", state.Resolutions[0].Type, ResolutionTypeRenewed)
 	}
-	if len(state.Formations) != 0 {
-		t.Fatalf("expected no formations from an abandoned renewal, got %d", len(state.Formations))
+	if len(state.Formations) != 1 {
+		t.Fatalf("expected one formation for the renewal-created contract, got %d", len(state.Formations))
 	}
-	// Abandoned renewals must not credit EarnedRevenue or RenterDeferredSpend.
-	assertCurrency(t, "abandoned earned revenue", state.Resolutions[0].HostEarnedRevenue, types.ZeroCurrency)
-	assertCurrency(t, "abandoned deferred spend", state.Resolutions[0].RenterDeferredSpend, types.ZeroCurrency)
+	// Regressed renewal: deferred spend clamps to zero rather than going negative.
+	assertCurrency(t, "regressed deferred spend", state.Resolutions[0].RenterDeferredSpend, types.ZeroCurrency)
 }
 
 func TestParseDiffsRevisionAndResolutionBothProcessed(t *testing.T) {
