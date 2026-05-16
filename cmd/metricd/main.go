@@ -29,10 +29,14 @@ func main() {
 		dir               string
 		logLevel          zap.AtomicLevel
 		network           string
+		syncerAddr        string
+		httpAddr          string
 		pruneRetainBlocks uint64
 	)
 	flag.StringVar(&dir, "dir", ".", "Directory to store metrics data")
 	flag.StringVar(&network, "network", "mainnet", "Network to connect to (e.g. mainnet, testnet)")
+	flag.StringVar(&syncerAddr, "addr", ":9981", "Address to listen on for syncer connections (e.g. :9981)")
+	flag.StringVar(&httpAddr, "http", ":9980", "Address to serve the HTTP API on (e.g. :9980)")
 	flag.TextVar(&logLevel, "log.level", zap.NewAtomicLevelAt(zap.InfoLevel), "Set the logging level (e.g. debug, info, warn, error)")
 	flag.Uint64Var(&pruneRetainBlocks, "prune.blocks", 0, "Recent blocks to retain in the consensus database (0 = no pruning)")
 	flag.Parse()
@@ -87,7 +91,7 @@ func main() {
 
 	cm := chain.NewManager(chainStore, cs, chain.WithLog(log.Named("chain")))
 
-	syncerListener, err := net.Listen("tcp", ":9981")
+	syncerListener, err := net.Listen("tcp", syncerAddr)
 	if err != nil {
 		log.Panic("failed to start syncer listener", zap.Error(err))
 	}
@@ -101,7 +105,13 @@ func main() {
 	s := syncer.New(syncerListener, cm, ps, gateway.Header{
 		GenesisID:  genesis.ID(),
 		UniqueID:   gateway.GenerateUniqueID(),
-		NetAddress: net.JoinHostPort("127.0.0.1", "9981"),
+		NetAddress: func() string {
+			host, port, _ := net.SplitHostPort(syncerAddr)
+			if ip := net.ParseIP(host); ip == nil || ip.IsUnspecified() {
+				return net.JoinHostPort("127.0.0.1", port)
+			}
+			return syncerAddr
+		}(),
 	}, syncer.WithLogger(log.Named("syncer")))
 	defer s.Close()
 	go s.Run()
@@ -112,7 +122,7 @@ func main() {
 	}
 	defer metrics.Close()
 
-	l, err := net.Listen("tcp", ":9980")
+	l, err := net.Listen("tcp", httpAddr)
 	if err != nil {
 		log.Panic("failed to start metrics listener", zap.Error(err))
 	}
